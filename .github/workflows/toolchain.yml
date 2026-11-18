@@ -1,15 +1,16 @@
 name: toolchain
 run-name: "${{ inputs.run_name != '' && format('{0} ({1})', inputs.run_name, inputs.compiler) || format('{0} ({1})', github.workflow, inputs.compiler) }}"
 
-on: 
-  # schedule:
-  #   - cron:  '0 12 * * *'
+env:
+  CMAKE_REF: 7e36e1eab5094a642c5a3c1771551f06b5ec3224
+
+on:
   workflow_dispatch:
     inputs:
       build_target:
         description: "Build target"
         required: false
-        default: "all-64bit"
+        default: "64bit"
         type: choice
         options:
         - 32bit
@@ -33,7 +34,7 @@ on:
       trigger_build:
         description: "Trigger mpv build action after success build"
         required: false
-        default: true
+        default: false
         type: boolean
       release:
         description: "Publish a release"
@@ -116,6 +117,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.CMAKE_REF }}
           path: mpv-winbuild-cmake
           fetch-depth: 0
 
@@ -195,6 +197,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.CMAKE_REF }}
           path: mpv-winbuild-cmake
           fetch-depth: 0
 

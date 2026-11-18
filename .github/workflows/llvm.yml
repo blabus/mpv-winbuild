@@ -1,7 +1,10 @@
 name: LLVM
 run-name: "${{ inputs.run_name != '' && inputs.run_name || github.workflow }}"
 
-on: 
+env:
+  CMAKE_REF: 7e36e1eab5094a642c5a3c1771551f06b5ec3224
+
+on:
   workflow_dispatch:
     inputs:
       pgo:
@@ -17,12 +20,12 @@ on:
       trigger_toolchain:
         description: "Trigger toolchain build action after success build"
         required: false
-        default: true
+        default: false
         type: boolean
       build_target:
         description: "Toolchain build target"
         required: false
-        default: "all-64bit"
+        default: "64bit"
         type: choice
         options:
         - 32bit
@@ -34,7 +37,7 @@ on:
       trigger_build:
         description: "Trigger mpv build action after toolchain build"
         required: false
-        default: true
+        default: false
         type: boolean
       release:
         description: "Publish a release after mpv build"
@@ -76,6 +79,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.CMAKE_REF }}
           path: mpv-winbuild-cmake
           fetch-depth: 0
 

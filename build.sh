@@ -74,10 +74,18 @@ build() {
         ninja -C $buildroot/build$bit rustup-fullclean
         ninja -C $buildroot/build$bit rustup
     fi
-    ninja -C $buildroot/build$bit update
+    if [ "$freeze_sources" == "true" ]; then
+        if [ ! -d "$srcdir/mpv/.git" ] || [ ! -d "$srcdir/ffmpeg/.git" ]; then
+            echo "freeze_sources: no cached sources to freeze. Stop"
+            exit 1
+        fi
+        echo "freeze_sources: skipping 'ninja update', building the cached source trees as they are"
+    else
+        ninja -C $buildroot/build$bit update
+    fi
     ninja -C $buildroot/build$bit mpv-fullclean
-    
-    ninja -C $buildroot/build$bit mpv
+
+    ninja -C $buildroot/build$bit mpv || { echo "ninja mpv failed. Stop"; exit 1; }
 
     if [ -n "$(find $buildroot/build$bit -maxdepth 1 -type d -name "mpv*$arch*" -print -quit)" ] ; then
         echo "Successfully compiled $bit-bit. Continue"
@@ -134,13 +142,14 @@ prepare() {
     fi
 }
 
-while getopts t:c:s:e: flag
+while getopts t:c:s:e:f: flag
 do
     case "${flag}" in
         t) target=${OPTARG};;
         c) compiler=${OPTARG};;
         s) simple_package=${OPTARG};;
         e) extra_option=${OPTARG};;
+        f) freeze_sources=${OPTARG};;
     esac
 done
 

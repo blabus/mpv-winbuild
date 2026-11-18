@@ -6,13 +6,26 @@ permissions:
   attestations: write
   contents: write
 
-on: 
+env:
+  MPV_COMMIT: 7b8915bc1d04c7e1b61184e00c7fbfaab1911e75
+  CMAKE_REF: 7e36e1eab5094a642c5a3c1771551f06b5ec3224
+
+on:
   workflow_dispatch:
     inputs:
+      release_label:
+        description: "Release tag is mpv-<10 hex>-<label>, e.g. stock-1, nvvfx-1; must be new"
+        required: false
+        default: ""
+      freeze_sources:
+        description: "Skip 'ninja update': build the cached dependency sources of the last run as they are"
+        required: false
+        default: false
+        type: boolean
       build_target:
         description: "Build target"
         required: false
-        default: "all-64bit"
+        default: "64bit"
         type: choice
         options:
         - 32bit
@@ -69,12 +82,18 @@ jobs:
     steps:
       - id: script
         uses: actions/github-script@v9
+        env:
+          LABEL: ${{ inputs.release_label }}
         with:
           script: |
+            if ("${{ inputs.release }}" == "true" && !/^[A-Za-z0-9._-]+$/.test(process.env.LABEL)) {
+              core.setFailed("release_label is required when release is true");
+              return;
+            }
             const commit = await github.rest.repos.getCommit({
               owner: 'mpv-player',
               repo: 'mpv',
-              ref: `master`
+              ref: process.env.MPV_COMMIT
             })
             core.setOutput('sha', String(commit.data.sha))
             
@@ -174,7 +193,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/archlinux/archlinux:base-devel
-    continue-on-error: true
     strategy:
       matrix: ${{ fromJson(needs.params.outputs.matrix) }}
 
@@ -197,6 +215,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.CMAKE_REF }}
           path: mpv-winbuild-cmake
           fetch-depth: 0
       - name: Prepare
@@ -380,6 +399,7 @@ jobs:
           ${{ inputs.command }}
       - name: Build
         id: build
+        timeout-minutes: 300
         shell: bash
         run: |
           chmod +x build.sh
@@ -392,7 +412,23 @@ jobs:
           if [ "${{ matrix.lgpl }}" = "true" ]; then
             git am --3way ../compile-lgpl-libmpv.patch
           fi
-          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
+          if [ -n "$PATCH_NOTE" ]; then
+            echo "::error::the prs input is not supported in this fork"; exit 1
+          fi
+          for d in ../local/cmake/*.diff; do
+            git apply --verbose "$d"
+          done
+          grep -qF "GIT_RESET ${MPV_COMMIT}" packages/mpv.cmake
+          if [ -f ../local/mpv/mpv-local.patch ]; then
+            grep -qF 'mpv-local.patch' packages/mpv.cmake
+            cp ../local/mpv/mpv-local.patch packages/mpv-local.patch
+          elif grep -qF 'mpv-local.patch' packages/mpv.cmake; then
+            echo "::error::mpv.cmake applies mpv-local.patch but local/mpv/mpv-local.patch is missing"; exit 1
+          fi
+          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}" -f "${{ inputs.freeze_sources == true && 'true' || 'false' }}"
+        env:
+          PATCH_NOTE: ${{ needs.params.outputs.patch_note }}
+
       - name: Collect logs
         if: ${{ always() }}
         run: |
@@ -471,29 +507,76 @@ jobs:
           archive: false
 
       - name: Save clang sysroot cache
-        if: ${{ inputs.compiler =='clang' && inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ !cancelled() && inputs.compiler =='clang' && inputs.no_save_cache != true && matrix.lgpl != true }}
         uses: actions/cache/save@v6.1.0
         with: 
           path: ${{ github.workspace }}/mpv-winbuild-cmake/clang_root
           key: ${{ matrix.bit }}-clang_root-${{ env.cache_suffix }}
       - name: Save Sources Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ !cancelled() && inputs.no_save_cache != true && matrix.lgpl != true }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/src_packages
           key: source-${{ env.cache_suffix }}
       - name: Save Rust Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ !cancelled() && inputs.no_save_cache != true && matrix.lgpl != true }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/install_rustup
           key: rust-${{ env.cache_suffix }}
       - name: Save Build Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ !cancelled() && inputs.no_save_cache != true && matrix.lgpl != true }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
           key: ${{ env.build_save_key }}
+
+      - name: Verify pinned commit and local patch
+        shell: bash
+        run: |
+          short="${MPV_COMMIT:0:10}"
+          dev=$(ls mpv-winbuild-cmake/release/mpv-dev-*-git-"$short".7z | head -n1)
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          7z e -o/tmp/verify "$dev" libmpv-2.dll -r >/dev/null
+          ver=$(grep -aoE "mpv v0\.[0-9.]+-[0-9]+-g${MPV_COMMIT:0:9}(-dirty)?" /tmp/verify/libmpv-2.dll | head -n1)
+          echo "libmpv reports: $ver"
+          if [ -f local/mpv/mpv-local.patch ]; then
+            [[ "$ver" == *-dirty ]]
+            grep -aq "nvvfx" /tmp/verify/libmpv-2.dll
+          else
+            [[ "$ver" != *-dirty ]]
+          fi
+
+      - name: Record versions
+        shell: bash
+        run: |
+          out="mpv-winbuild-cmake/release/versions-${{ matrix.bit }}.txt"
+          {
+            echo "fork: ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+            echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "mpv-winbuild-cmake: $(git -C mpv-winbuild-cmake rev-parse HEAD)"
+            sha256sum local/cmake/*.diff local/mpv/*.patch 2>/dev/null || true
+            echo "compiler: $(mpv-winbuild-cmake/build${{ matrix.bit }}/exec clang --version 2>/dev/null | head -n1)"
+            echo "rustc: $(mpv-winbuild-cmake/build${{ matrix.bit }}/exec rustc --version 2>/dev/null)"
+            echo "# package  HEAD  upstream  commit-date  describe"
+            for d in mpv-winbuild-cmake/src_packages/*/; do
+              [ -e "$d/.git" ] || continue
+              printf '%s %s %s %s %s\n' "$(basename "$d")" \
+                "$(git -C "$d" rev-parse HEAD)" \
+                "$(git -C "$d" rev-parse '@{u}' 2>/dev/null || echo -)" \
+                "$(git -C "$d" log -1 --format=%cI HEAD)" \
+                "$(git -C "$d" describe --tags --always --dirty 2>/dev/null || echo -)"
+            done
+            echo "# non-git sources"
+            find mpv-winbuild-cmake/src_packages -maxdepth 1 -type f -printf '%f\n' | sort
+          } > "$out"
+          cat "$out"
+
+      - name: upload versions
+        uses: actions/upload-artifact@v7
+        with:
+          path: mpv-winbuild-cmake/release/versions-${{ matrix.bit }}.txt
+          archive: false
 
       - name: "Job summary"
         uses: actions/github-script@v9
@@ -614,7 +697,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: '{mpv,ffmpeg}*'
+          pattern: '{mpv,ffmpeg,versions}*'
           merge-multiple: true
           skip-decompress : true
     
@@ -632,27 +715,24 @@ jobs:
         run: |
           echo "long_time=$(date "+%Y-%m-%d %H:%M")" >> $GITHUB_ENV
           echo "short_time=$(date "+%Y-%m-%d")" >> $GITHUB_ENV
-          echo "tag_name=$(date "+%Y-%m-%d")-$(head -c 10 <<< "${{needs.params.outputs.sha}}")"  >> $GITHUB_ENV
+          [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::release_label is required ([A-Za-z0-9._-])"; exit 1; }
+          echo "tag_name=mpv-$(head -c 10 <<< "${{needs.params.outputs.sha}}")-${LABEL}"  >> $GITHUB_ENV
+        shell: bash
+        env:
+          LABEL: ${{ inputs.release_label }}
 
-      - name: Commit version & remove existing tag
+      - name: Refuse an existing tag
         env:
           tag_name: ${{ env.tag_name }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          git fetch --tags
-          git checkout version || git checkout -b version origin/version || ( git checkout --orphan version && git rm -rf . )
-          echo -e "${tag_name}" > version
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add version
-          git diff-index --quiet HEAD || ( git commit -m "${tag_name}" && git push origin version )
-          if [ $(git tag -l "${tag_name}") ] ;then
-            gh release delete "${tag_name}" || true
-            git push --delete origin "${tag_name}" || true
-            git tag -d "${tag_name}" || true
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag_name}" >/dev/null; then
+            echo "::error::tag ${tag_name} exists; releases here are permanent, choose a new release_label"; exit 1
           fi
-          git checkout main
+          if gh release view "${tag_name}" >/dev/null 2>&1; then
+            echo "::error::release ${tag_name} exists"; exit 1
+          fi
 
       - name: "Generate release note & sha256"
         id: note
@@ -664,6 +744,9 @@ jobs:
             note+="**Build Time**: ${{ env.long_time }}\n";
             note+="**Compiler**: ${{ inputs.compiler }}\n";
             note+="**Build Details**: https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}\n";
+            note+="**Fork commit**: https://github.com/${{github.repository}}/commit/${{github.sha}}\n";
+            note+="**mpv-winbuild-cmake**: https://github.com/shinchiro/mpv-winbuild-cmake/commit/${process.env.CMAKE_REF}\n";
+            note+="**Dependency versions**: versions-*.txt in this release\n";
             const patch_note = `${{ needs.params.outputs.patch_note }}` ;
             if (patch_note) {
               note+=`Merged Prs:\n${patch_note}\n`;
@@ -711,12 +794,12 @@ jobs:
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "artifacts/mpv*.7z,artifacts/ffmpeg*.7z,sha256.txt"
-          commit: version
-          name: "${{ env.long_time }}"
+          artifacts: "artifacts/mpv*.7z,artifacts/ffmpeg*.7z,artifacts/versions*.txt,sha256.txt"
+          commit: ${{ github.sha }}
+          name: "${{ env.tag_name }}"
           body: "${{ steps.note.outputs.note }}"
           tag: "${{ env.tag_name }}"
-          allowUpdates: true
+          allowUpdates: false
           artifactErrorsFailBuild: true
           prerelease: false
           makeLatest: true
@@ -725,13 +808,6 @@ jobs:
         continue-on-error: true
         with:
           subject-path: 'artifacts/*.7z'
-      - name: Prune old releases
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git checkout main
-          bash prunetags.sh
 
   cache:
     name: keep cache alive
