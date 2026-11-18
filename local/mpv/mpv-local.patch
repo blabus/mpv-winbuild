@@ -134,10 +134,10 @@ index 0000000..6fbeacf
 +Write-Host "wrote $out using $Fxc"
 diff --git a/video/filter/nvvfx_core.c b/video/filter/nvvfx_core.c
 new file mode 100644
-index 0000000..17c1f7a
+index 0000000..2b20320
 --- /dev/null
 +++ b/video/filter/nvvfx_core.c
-@@ -0,0 +1,3537 @@
+@@ -0,0 +1,3682 @@
 +/*
 + * nvvfx_core.c - see nvvfx_core.h.
 + *
@@ -3105,12 +3105,20 @@ index 0000000..17c1f7a
 +
 +/* ======================================================================== cross-device transfer */
 +
-+/* With NVVFX_XFER_NO_FLUSH: how long a put may wait for the peer's own next
-+ * submission before the run side flushes the peer itself (for a peer that has
-+ * stopped submitting: a paused or idle VO). A presenting peer gets there
-+ * first: its copies were measured complete within 95 ms at a 20 Hz present
-+ * rate, and a flush while it presents would block (see the transfer notes). */
-+#define NVVFX_PEER_FLUSH_AFTER_MS 150.0
++/* The run side's flushes of the peer, with NVVFX_XFER_NO_FLUSH (see
++ * peer_wait and "cross-device transfer" in the header). A put this old and
++ * still not complete is flushed by the run side, and the peer is then taken
++ * to be idle (a paused or seeking VO): a presenting VO's own submissions
++ * complete a put well within it (measured at most 48 ms at 24 Hz, 36 ms at
++ * 60 Hz, 41 ms at 20 Hz). */
++#define NVVFX_PEER_FLUSH_AFTER_MS 100.0
++/* While the peer is idle: the age at which a put is flushed (at once). */
++#define NVVFX_PEER_IDLE_FLUSH_AFTER_MS 0.0
++/* While the peer is idle: one put in this long is left to the peer for
++ * NVVFX_PEER_FLUSH_AFTER_MS, to see whether it submits again. */
++#define NVVFX_PEER_IDLE_PROBE_MS 500.0
++/* A flush of the peer that takes longer than this: the peer presents. */
++#define NVVFX_PEER_BLOCKED_MS 4.0
 +
 +#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 +#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -3126,6 +3134,15 @@ index 0000000..17c1f7a
 +    ID3D11Query *q[NVVFX_XFER_MAX_SLOTS];
 +    int keyed;                     /* NVVFX_XFER_KEYED_MUTEX */
 +    int no_flush;                  /* NVVFX_XFER_NO_FLUSH */
++    /* the run side's flushes of the peer (nvvfx_xfer_set_peer_flush) */
++    double flush_after_ms;         /* a put not complete after this long: flush the peer */
++    double idle_after_ms;          /* the same while the peer is idle; < 0: no idle mode */
++    double probe_ms;               /* while idle, one put in this long is a probe */
++    double blocked_ms;             /* a flush longer than this: the peer presents */
++    int peer_idle;
++    double probe_at;               /* now_ms() at the last probe (or the entry into idle mode) */
++    double last_flush_end;         /* now_ms() at the end of the run side's last flush */
++    int peer_flushes, idle_enters, idle_exits;
 +    IDXGIKeyedMutex *in_km[NVVFX_XFER_MAX_SLOTS], *out_km[NVVFX_XFER_MAX_SLOTS];
 +    int held[NVVFX_XFER_MAX_SLOTS];/* the run side holds both keys of the slot */
 +    HANDLE timer;                  /* the run side's naps */
@@ -3142,6 +3159,7 @@ index 0000000..17c1f7a
 +    ID3D11Query *q[NVVFX_XFER_MAX_SLOTS];
 +    IDXGIKeyedMutex *in_km[NVVFX_XFER_MAX_SLOTS], *out_km[NVVFX_XFER_MAX_SLOTS];
 +    double put_ms[3];              /* the last put: copy, query end, flush (CPU) */
++    double put_at[NVVFX_XFER_MAX_SLOTS]; /* now_ms() as each slot's last put began */
 +};
 +
 +static int make_shared(nvvfx_xfer *x, int w, int h, UINT bind, ID3D11Texture2D **tex, HANDLE *share,
@@ -3208,6 +3226,10 @@ index 0000000..17c1f7a
 +    x->slots = slots;
 +    x->keyed = !!(flags & NVVFX_XFER_KEYED_MUTEX);
 +    x->no_flush = !!(flags & NVVFX_XFER_NO_FLUSH);
++    x->flush_after_ms = NVVFX_PEER_FLUSH_AFTER_MS;
++    x->idle_after_ms = NVVFX_PEER_IDLE_FLUSH_AFTER_MS;
++    x->probe_ms = NVVFX_PEER_IDLE_PROBE_MS;
++    x->blocked_ms = NVVFX_PEER_BLOCKED_MS;
 +    x->in_w = p->info.in_w;
 +    x->in_h = p->info.in_h;
 +    x->out_w = p->info.out_w;
@@ -3312,6 +3334,7 @@ index 0000000..17c1f7a
 +    }
 +    pr->x = x;
 +    pr->dev = peer;
++    x->peer_idle = 0;              /* a new peer: no run is in progress (slot rules) */
 +    ID3D11Device_AddRef(peer);
 +    ID3D11Device_GetImmediateContext(peer, &pr->ctx);
 +    InterlockedIncrement(&x->peers);
@@ -3414,6 +3437,7 @@ index 0000000..17c1f7a
 +    box.back = 1;
 +    {
 +        double t0 = now_ms(), t1, t2;
++        pr->put_at[slot] = t0;
 +        if (pr->in_km[slot]) {
 +            /* By the slot rules the run side does not hold it, so this never
 +             * waits (see xfer_acquire). */
@@ -3526,13 +3550,134 @@ index 0000000..17c1f7a
 +    }
 +}
 +
++/* The peer's query, waited for with the run side's flush policy.
++ *
++ * Normally the peer's own submissions carry a put to its GPU, and the run
++ * side flushes the peer (a GetData without DONOTFLUSH, timed) only for a put
++ * that is flush_after_ms old and still not complete: an age counted from the
++ * put, so a put that waited behind other runs is flushed as soon as its turn
++ * comes. Such a flush, if quick, means nothing has submitted the peer's work
++ * for that long: the peer is idle (a paused or seeking VO, which renders
++ * nothing), and idle mode is entered.
++ *
++ * In idle mode a put is flushed once it is idle_after_ms old (at once by
++ * default), so a frame costs about its own GPU time. Idle mode is left when
++ * the peer submits again: a flush that takes longer than blocked_ms (the
++ * peer presents; flushing a presenting device blocks), or a probe that the
++ * peer completes. A probe is one put in every probe_ms that is waited for as
++ * in normal mode: completed without the run side's help (it began after the
++ * run side's last flush), it shows the peer is submitting again; flushed by
++ * the run side, quickly, the peer is still idle. So the run side flushes a
++ * presenting peer for at most about probe_ms after it resumes. */
++static int peer_wait(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms)
++{
++    const char *what = "the video device's copy into the shared texture";
++    double t0 = now_ms(), deadline = t0 + (timeout_ms > 0 ? timeout_ms : 0);
++    double put_at = pr->put_at[slot] > 0 && pr->put_at[slot] <= t0 ? pr->put_at[slot] : t0;
++    int idle = x->no_flush && x->peer_idle;
++    int probe = idle && t0 - x->probe_at >= x->probe_ms;
++    double after = !x->no_flush ? -1.0 : idle && !probe ? x->idle_after_ms : x->flush_after_ms;
++    double next_flush = after >= 0 ? put_at + after : deadline + 1;
++    int n = 0, flushed = 0;
++    if (probe)
++        x->probe_at = t0;
++    for (;;) {
++        BOOL done = FALSE;
++        HRESULT hr;
++        if (now_ms() >= next_flush) {
++            double tf = now_ms(), d;
++            int change = 0;
++            hr = ID3D11DeviceContext_GetData(pr->ctx, (ID3D11Asynchronous *)pr->q[slot], &done,
++                                             sizeof(done), 0);
++            x->last_flush_end = now_ms();
++            d = x->last_flush_end - tf;
++            flushed = 1;
++            EnterCriticalSection(&x->stats_lock);
++            ring_push(&x->wall[NVVFX_XFER_PEER_FLUSH], d);
++            x->peer_flushes++;
++            if (d > x->blocked_ms && x->peer_idle) {
++                x->peer_idle = 0;
++                x->idle_exits++;
++                change = -1;
++            } else if (d <= x->blocked_ms && !x->peer_idle && x->idle_after_ms >= 0) {
++                x->peer_idle = 1;
++                x->probe_at = x->last_flush_end;
++                x->idle_enters++;
++                change = 1;
++            }
++            LeaveCriticalSection(&x->stats_lock);
++            if (change > 0)
++                logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: the video device submitted nothing for %.0f ms: "
++                     "idle; its copies are flushed from here until it submits again", x->flush_after_ms);
++            else if (change < 0)
++                logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: a flush of the video device took %.1f ms: it "
++                     "presents; its copies are left to it again", d);
++            next_flush = now_ms() + (x->flush_after_ms > 1 ? x->flush_after_ms : 1.0);
++        } else {
++            hr = ID3D11DeviceContext_GetData(pr->ctx, (ID3D11Asynchronous *)pr->q[slot], &done,
++                                             sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
++        }
++        if (hr == S_OK) {
++            if (probe && !flushed && x->peer_idle && put_at > x->last_flush_end) {
++                EnterCriticalSection(&x->stats_lock);
++                x->peer_idle = 0;
++                x->idle_exits++;
++                LeaveCriticalSection(&x->stats_lock);
++                logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: the video device completed a copy itself in "
++                     "%.0f ms: it submits again; its copies are left to it again", now_ms() - put_at);
++            }
++            return NVVFX_OK;
++        }
++        if (FAILED(hr)) {
++            HRESULT why = ID3D11Device_GetDeviceRemovedReason(pr->dev);
++            return fail(&x->rt->lg, NVVFX_E_PEER_LOST, "%s: GetData failed: HRESULT 0x%08lx (device "
++                        "removed reason 0x%08lx)", what, (unsigned long)hr, (unsigned long)why);
++        }
++        if (now_ms() >= deadline) {
++            HRESULT why = ID3D11Device_GetDeviceRemovedReason(pr->dev);
++            if (why != S_OK)
++                return fail(&x->rt->lg, NVVFX_E_PEER_LOST, "%s: the device was removed (HRESULT "
++                            "0x%08lx)", what, (unsigned long)why);
++            return fail(&x->rt->lg, NVVFX_E_TIMEOUT, "%s: not finished after %d ms", what, timeout_ms);
++        }
++        if (n++ < 8)
++            SwitchToThread();
++        else
++            xfer_nap(x);
++    }
++}
++
 +int nvvfx_xfer_wait_peer(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms)
 +{
 +    if (!x || !pr || pr->x != x || slot < 0 || slot >= x->slots)
 +        return NVVFX_E_ARG;
-+    return query_wait(x, pr->dev, pr->ctx, pr->q[slot], timeout_ms, NVVFX_E_PEER_LOST,
-+                      "the video device's copy into the shared texture",
-+                      x->no_flush ? NVVFX_PEER_FLUSH_AFTER_MS : 0.0);
++    return peer_wait(x, pr, slot, timeout_ms);
++}
++
++void nvvfx_xfer_set_peer_flush(nvvfx_xfer *x, double after_ms, double idle_after_ms, double probe_ms,
++                               double blocked_ms)
++{
++    if (!x)
++        return;
++    x->flush_after_ms = after_ms;
++    x->idle_after_ms = idle_after_ms;
++    x->probe_ms = probe_ms;
++    x->blocked_ms = blocked_ms;
++    x->peer_idle = 0;
++}
++
++void nvvfx_xfer_peer_counts(const nvvfx_xfer *x, int *flushes, int *idle_enters, int *idle_exits)
++{
++    if (!x)
++        return;
++    EnterCriticalSection((CRITICAL_SECTION *)&x->stats_lock);
++    if (flushes)
++        *flushes = x->peer_flushes;
++    if (idle_enters)
++        *idle_enters = x->idle_enters;
++    if (idle_exits)
++        *idle_exits = x->idle_exits;
++    LeaveCriticalSection((CRITICAL_SECTION *)&x->stats_lock);
 +}
 +
 +/*
@@ -3677,10 +3822,10 @@ index 0000000..17c1f7a
 +}
 diff --git a/video/filter/nvvfx_core.h b/video/filter/nvvfx_core.h
 new file mode 100644
-index 0000000..1414c03
+index 0000000..2ca7563
 --- /dev/null
 +++ b/video/filter/nvvfx_core.h
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,568 @@
 +/*
 + * nvvfx_core.h - the NVIDIA-facing core of vf_nvvfx: NVIDIA Video Effects SDK
 + * 1.3 "VideoSuperRes" on Direct3D 11 R10G10B10A2 frames, entirely on the GPU.
@@ -4111,7 +4256,7 @@ index 0000000..1414c03
 + * after timeout_ms with NVVFX_E_TIMEOUT; a removed device is NVVFX_E_LOST
 + * (private) or NVVFX_E_PEER_LOST (peer).
 + *
-+ * The peer is never flushed by default (NVVFX_XFER_NO_FLUSH): a put only
++ * A put never flushes the peer by default (NVVFX_XFER_NO_FLUSH): it only
 + * records a copy and a query end, and the peer's own next submission (mpv's
 + * VO renders and presents every refresh) carries them to the GPU. Measured
 + * (nvvfx-harness "vo", --flush-probe): on a device presenting at vsync, a
@@ -4124,10 +4269,28 @@ index 0000000..1414c03
 + * at a median 13 ms / worst 34 ms at 60 Hz and 18-22 ms / worst 95 ms at
 + * 20 Hz, so a caller should keep several frames in flight (vf_nvvfx keeps
 + * four: at 24 fps and a 20 Hz present rate two slots left half the results
-+ * late, three left 4% late with the heaviest settings, four none). If a put
-+ * has not completed after
-+ * NVVFX_PEER_FLUSH_AFTER_MS (150 ms; a paused or idle peer), the run side
-+ * flushes the peer itself (a GetData without DONOTFLUSH).
++ * late, three left 4% late with the heaviest settings, four none).
++ *
++ * A peer that renders nothing (a paused VO, or one waiting for an exact
++ * seek's target frame while every frame before it goes through the pipeline)
++ * submits nothing, so the run side flushes it (a GetData without DONOTFLUSH)
++ * when a put is NVVFX_PEER_FLUSH_AFTER_MS old (100 ms, counted from the put)
++ * and still not complete; a presenting peer always gets there first. A quick
++ * such flush enters idle mode, in which the run side flushes every put at
++ * once, so a frame costs about its own GPU time; one put in every
++ * NVVFX_PEER_IDLE_PROBE_MS (500 ms) is left to the peer as before, and idle
++ * mode ends when the peer completes one itself or a flush blocks. So a
++ * presenting peer is flushed by the run side for at most about half a second
++ * after it resumes (12-13 frames at 24 fps, measured). Measured (nvvfx-harness
++ * "vo", 25 s at 4K -> 8K with the run side flushing every put at once while
++ * the peer presents at 24, 60 and 20 Hz): those flushes take a median 0.00 ms,
++ * worst 0.2-0.3 ms, and another thread's waits for the peer's lock stay at a
++ * p99 of 0.001-0.004 ms, worst 0.2-3.7 ms (0.03-0.1 ms with no flushes). The
++ * 7-15 ms above were a thread flushing a new copy every 4 ms; one flush per
++ * frame costs far less, though not nothing, which is why it is kept to an
++ * idle peer and the half second after. Flushing 4 or 10 ms after the put was
++ * no better than at once (worst flushes 3-11 ms, one lock wait of 24 ms at
++ * 60 Hz).
 + *
 + * Slot rules (the caller's to keep): put into a slot only when no run of it is
 + * in progress; get from it only after its run returned NVVFX_OK and before the
@@ -4145,7 +4308,8 @@ index 0000000..1414c03
 +#define NVVFX_XFER_LEGACY_SHARED  0  /* D3D11_RESOURCE_MISC_SHARED textures */
 +#define NVVFX_XFER_KEYED_MUTEX    1  /* D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX (diagnosis only) */
 +#define NVVFX_XFER_NO_FLUSH       2  /* a put does not flush the peer: the peer's own next
-+                                        submission carries it (see the transfer notes) */
++                                        submission carries it, or the run side flushes an
++                                        idle peer (see the transfer notes) */
 +#define NVVFX_XFER_DEFAULT        (NVVFX_XFER_LEGACY_SHARED | NVVFX_XFER_NO_FLUSH)
 +nvvfx_xfer *nvvfx_xfer_create_ex(nvvfx_pipeline *p, int slots, int flags);
 +void nvvfx_xfer_destroy(nvvfx_xfer *x);
@@ -4170,12 +4334,25 @@ index 0000000..1414c03
 +/* The CPU time of the last put's three calls: copy, query end, flush (ms). */
 +void nvvfx_peer_put_times(const nvvfx_peer *pr, double ms[3]);
 +
-+/* Run side, one thread at a time per xfer. */
++/* Run side, one thread at a time per xfer. nvvfx_xfer_wait_peer applies the
++ * flush policy for an idle peer (see the transfer notes). */
 +int nvvfx_xfer_wait_peer(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms);
 +int nvvfx_xfer_submit(nvvfx_xfer *x, int slot);
 +int nvvfx_xfer_wait_done(nvvfx_xfer *x, int slot, int timeout_ms);
 +/* The three in order, timed into the xfer's stats. */
 +int nvvfx_xfer_run(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms);
++/* The run side's flush policy (the defaults are the core's; for tests): a put
++ * after_ms old and not complete is flushed by the run side; a quick such
++ * flush enters idle mode (idle_after_ms >= 0; < 0 disables it), in which a put
++ * is flushed once it is idle_after_ms old, except one in every probe_ms,
++ * which is waited for as normal; idle mode is left when such a probe
++ * completes without the run side's flush, or when a flush takes longer than
++ * blocked_ms. Resets the mode. */
++void nvvfx_xfer_set_peer_flush(nvvfx_xfer *x, double after_ms, double idle_after_ms, double probe_ms,
++                               double blocked_ms);
++/* Counts since creation: flushes of the peer, idle-mode entries and exits. */
++void nvvfx_xfer_peer_counts(const nvvfx_xfer *x, int *flushes, int *idle_enters, int *idle_exits);
++
 +/* For a caller that makes the three calls itself: record one run's times. */
 +void nvvfx_xfer_note_times(nvvfx_xfer *x, double wait_peer_ms, double submit_ms, double wait_done_ms);
 +/* The core's clock (QueryPerformanceCounter, ms). */
@@ -4187,7 +4364,8 @@ index 0000000..1414c03
 +#define NVVFX_XFER_SUBMIT     1  /* the pipeline run call (CPU: queuing) */
 +#define NVVFX_XFER_WAIT_DONE  2  /* from the end of the submit to the private device's completion */
 +#define NVVFX_XFER_CYCLE      3  /* the whole nvvfx_xfer_run */
-+#define NVVFX_XFER_STAT_COUNT 4
++#define NVVFX_XFER_PEER_FLUSH 4  /* each flush of the peer by the run side */
++#define NVVFX_XFER_STAT_COUNT 5
 +
 +void nvvfx_xfer_stats(const nvvfx_xfer *x, int which, nvvfx_stage_stats *out);
 +void nvvfx_xfer_reset_stats(nvvfx_xfer *x);
@@ -4535,10 +4713,10 @@ index 0000000..9939e9e
 +#endif
 diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
 new file mode 100644
-index 0000000..28aaa89
+index 0000000..b74a898
 --- /dev/null
 +++ b/video/filter/vf_nvvfx.c
-@@ -0,0 +1,2625 @@
+@@ -0,0 +1,2628 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -4574,9 +4752,11 @@ index 0000000..28aaa89
 + * private D3D11 device the core creates on the VO's adapter (found by LUID),
 + * once per process, on a worker thread; the VO's device (which decodes,
 + * converts and presents) only ever records plain copies into and out of
-+ * shared R10G10B10A2 textures and an event query, never a flush: the VO's own
-+ * next submission carries them. (With CUDA's D3D11 interop on the VO's
-+ * device, mpv reset the GPU driver within seconds.) Neither device ever waits
++ * shared R10G10B10A2 textures and an event query, and the playloop never
++ * flushes it: the VO's own next submission carries them, and only while the
++ * VO renders nothing (paused, or an exact seek) does the runner flush them
++ * itself. (With CUDA's D3D11 interop on the VO's device, mpv reset the GPU
++ * driver within seconds.) Neither device ever waits
 + * on the GPU for the other: every handover is a CPU wait on a runner thread
 + * for an event query on the device that produced the data (see "cross-device
 + * transfer" in nvvfx_core.h).
@@ -4668,14 +4848,15 @@ index 0000000..28aaa89
 +#define NVVFX_MEM_RESERVE_MB_8K  5120
 +
 +// Frames in flight (each a pair of shared textures in the pipeline's cache
-+// entry: ~66 MB at 4K, ~166 MB at 4K -> 8K). The VO device is never flushed
-+// from here (a flush on a device that presents blocks, with its lock held,
++// entry: ~66 MB at 4K, ~166 MB at 4K -> 8K). The playloop never flushes the
++// VO device (a flush on a device that presents can block, with its lock held,
 +// for up to several refreshes), so a copy into or out of a slot reaches the
-+// GPU with the VO's own next submission. Measured in nvvfx-harness "vo" at
-+// 24 fps: at a 20 Hz present rate (slower than a 23.976 Hz display) two slots
-+// left half the results late, three left 4% late by up to 13 ms with
-+// Deblur Ultra + HighBitrate Ultra 4K -> 8K, four left none; at 60 Hz three
-+// left none.
++// GPU with the VO's own next submission, or, while the VO renders nothing,
++// with the runner's flush (nvvfx_xfer_wait_peer). Measured in nvvfx-harness
++// "vo" at 24 fps: at a 20 Hz present rate (slower than a 23.976 Hz display)
++// two slots left half the results late, three left 4% late by up to 13 ms
++// with Deblur Ultra + HighBitrate Ultra 4K -> 8K, four left none; at 60 Hz
++// three left none.
 +#define NVVFX_SLOTS 4
 +// Frames held in order: the ones in flight plus passthrough frames behind them.
 +#define NVVFX_QUEUE (NVVFX_SLOTS + 2)
