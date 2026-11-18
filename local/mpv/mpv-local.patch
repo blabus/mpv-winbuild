@@ -134,10 +134,10 @@ index 0000000..6fbeacf
 +Write-Host "wrote $out using $Fxc"
 diff --git a/video/filter/nvvfx_core.c b/video/filter/nvvfx_core.c
 new file mode 100644
-index 0000000..2b20320
+index 0000000..455df39
 --- /dev/null
 +++ b/video/filter/nvvfx_core.c
-@@ -0,0 +1,3682 @@
+@@ -0,0 +1,3693 @@
 +/*
 + * nvvfx_core.c - see nvvfx_core.h.
 + *
@@ -3106,11 +3106,11 @@ index 0000000..2b20320
 +/* ======================================================================== cross-device transfer */
 +
 +/* The run side's flushes of the peer, with NVVFX_XFER_NO_FLUSH (see
-+ * peer_wait and "cross-device transfer" in the header). A put this old and
-+ * still not complete is flushed by the run side, and the peer is then taken
-+ * to be idle (a paused or seeking VO): a presenting VO's own submissions
-+ * complete a put well within it (measured at most 48 ms at 24 Hz, 36 ms at
-+ * 60 Hz, 41 ms at 20 Hz). */
++ * peer_wait and "cross-device transfer" in the header). A put the run side
++ * has itself waited this long for is flushed by it, and the peer is then
++ * taken to be idle (a paused or seeking VO): a presenting VO's own
++ * submissions complete a put well within it (measured at most 48 ms from the
++ * put at 24 Hz, 36 ms at 60 Hz, 41 ms at 20 Hz). */
 +#define NVVFX_PEER_FLUSH_AFTER_MS 100.0
 +/* While the peer is idle: the age at which a put is flushed (at once). */
 +#define NVVFX_PEER_IDLE_FLUSH_AFTER_MS 0.0
@@ -3552,23 +3552,29 @@ index 0000000..2b20320
 +
 +/* The peer's query, waited for with the run side's flush policy.
 + *
-+ * Normally the peer's own submissions carry a put to its GPU, and the run
-+ * side flushes the peer (a GetData without DONOTFLUSH, timed) only for a put
-+ * that is flush_after_ms old and still not complete: an age counted from the
-+ * put, so a put that waited behind other runs is flushed as soon as its turn
-+ * comes. Such a flush, if quick, means nothing has submitted the peer's work
-+ * for that long: the peer is idle (a paused or seeking VO, which renders
++ * A put that is already complete is never flushed: every wait looks first
++ * (GetData with DONOTFLUSH). Normally the peer's own submissions carry a put
++ * to its GPU, and the run side flushes the peer (a GetData without
++ * DONOTFLUSH, timed) only once it has itself waited flush_after_ms for the
++ * put: counted from the start of this wait, during which nothing of the run
++ * side's is on the private device, so a put that is old because it queued
++ * behind other runs (a GPU at its limit) is not mistaken for a peer that
++ * submits nothing. Such a flush, if quick, means the peer has submitted
++ * nothing for that long: it is idle (a paused or seeking VO, which renders
 + * nothing), and idle mode is entered.
 + *
-+ * In idle mode a put is flushed once it is idle_after_ms old (at once by
-+ * default), so a frame costs about its own GPU time. Idle mode is left when
-+ * the peer submits again: a flush that takes longer than blocked_ms (the
-+ * peer presents; flushing a presenting device blocks), or a probe that the
-+ * peer completes. A probe is one put in every probe_ms that is waited for as
-+ * in normal mode: completed without the run side's help (it began after the
-+ * run side's last flush), it shows the peer is submitting again; flushed by
-+ * the run side, quickly, the peer is still idle. So the run side flushes a
-+ * presenting peer for at most about probe_ms after it resumes. */
++ * In idle mode a put still pending is flushed once it is idle_after_ms old
++ * (at once by default), so a frame costs about its own GPU time. Idle mode is
++ * left when the peer submits again: a flush that takes longer than
++ * blocked_ms (the peer presents; flushing a presenting device blocks), or a
++ * probe that the peer completes. A probe is one put in every probe_ms that is
++ * left to the peer until it is flush_after_ms old, counted from the put (the
++ * peer is already known to have been idle, and a put that waited behind
++ * other runs has had that long to be carried): completed without the run
++ * side's help (it began after the run side's last flush), it shows the peer
++ * is submitting again; flushed by the run side, quickly, the peer is still
++ * idle. So the run side flushes a presenting peer for at most about probe_ms
++ * after it resumes. */
 +static int peer_wait(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms)
 +{
 +    const char *what = "the video device's copy into the shared texture";
@@ -3576,15 +3582,23 @@ index 0000000..2b20320
 +    double put_at = pr->put_at[slot] > 0 && pr->put_at[slot] <= t0 ? pr->put_at[slot] : t0;
 +    int idle = x->no_flush && x->peer_idle;
 +    int probe = idle && t0 - x->probe_at >= x->probe_ms;
-+    double after = !x->no_flush ? -1.0 : idle && !probe ? x->idle_after_ms : x->flush_after_ms;
-+    double next_flush = after >= 0 ? put_at + after : deadline + 1;
++    double next_flush;
 +    int n = 0, flushed = 0;
++    if (!x->no_flush || (idle && !probe && x->idle_after_ms < 0) || ((!idle || probe) && x->flush_after_ms < 0))
++        next_flush = deadline + 1;
++    else if (idle && !probe)
++        next_flush = put_at + x->idle_after_ms;
++    else if (probe)
++        next_flush = put_at + x->flush_after_ms;
++    else
++        next_flush = t0 + x->flush_after_ms;
 +    if (probe)
 +        x->probe_at = t0;
 +    for (;;) {
 +        BOOL done = FALSE;
-+        HRESULT hr;
-+        if (now_ms() >= next_flush) {
++        HRESULT hr = ID3D11DeviceContext_GetData(pr->ctx, (ID3D11Asynchronous *)pr->q[slot], &done,
++                                                 sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
++        if (hr == S_FALSE && now_ms() >= next_flush) {
 +            double tf = now_ms(), d;
 +            int change = 0;
 +            hr = ID3D11DeviceContext_GetData(pr->ctx, (ID3D11Asynchronous *)pr->q[slot], &done,
@@ -3608,14 +3622,11 @@ index 0000000..2b20320
 +            LeaveCriticalSection(&x->stats_lock);
 +            if (change > 0)
 +                logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: the video device submitted nothing for %.0f ms: "
-+                     "idle; its copies are flushed from here until it submits again", x->flush_after_ms);
++                     "idle; its copies are flushed from here until it submits again", x->last_flush_end - t0);
 +            else if (change < 0)
 +                logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: a flush of the video device took %.1f ms: it "
 +                     "presents; its copies are left to it again", d);
 +            next_flush = now_ms() + (x->flush_after_ms > 1 ? x->flush_after_ms : 1.0);
-+        } else {
-+            hr = ID3D11DeviceContext_GetData(pr->ctx, (ID3D11Asynchronous *)pr->q[slot], &done,
-+                                             sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
 +        }
 +        if (hr == S_OK) {
 +            if (probe && !flushed && x->peer_idle && put_at > x->last_flush_end) {
@@ -3822,10 +3833,10 @@ index 0000000..2b20320
 +}
 diff --git a/video/filter/nvvfx_core.h b/video/filter/nvvfx_core.h
 new file mode 100644
-index 0000000..2ca7563
+index 0000000..5437b41
 --- /dev/null
 +++ b/video/filter/nvvfx_core.h
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,574 @@
 +/*
 + * nvvfx_core.h - the NVIDIA-facing core of vf_nvvfx: NVIDIA Video Effects SDK
 + * 1.3 "VideoSuperRes" on Direct3D 11 R10G10B10A2 frames, entirely on the GPU.
@@ -4274,14 +4285,20 @@ index 0000000..2ca7563
 + * A peer that renders nothing (a paused VO, or one waiting for an exact
 + * seek's target frame while every frame before it goes through the pipeline)
 + * submits nothing, so the run side flushes it (a GetData without DONOTFLUSH)
-+ * when a put is NVVFX_PEER_FLUSH_AFTER_MS old (100 ms, counted from the put)
-+ * and still not complete; a presenting peer always gets there first. A quick
-+ * such flush enters idle mode, in which the run side flushes every put at
-+ * once, so a frame costs about its own GPU time; one put in every
-+ * NVVFX_PEER_IDLE_PROBE_MS (500 ms) is left to the peer as before, and idle
-+ * mode ends when the peer completes one itself or a flush blocks. So a
++ * once it has itself waited NVVFX_PEER_FLUSH_AFTER_MS (100 ms) for a put
++ * that is still not complete; a presenting peer always gets there first. The
++ * wait is counted from its own start, not from the put, and a put already
++ * complete is never flushed: at a GPU's limit puts queue behind other runs
++ * and are 100+ ms old when their turn comes, and counted from the put (as
++ * nvvfx-4 did) they made a presenting peer look idle several times a second
++ * (harness "vo", ultra/ultra fed back to back: idle mode entered at once and
++ * every put flushed from then on). A quick such flush enters idle mode, in
++ * which the run side flushes every pending put at once, so a frame costs
++ * about its own GPU time; one put in every NVVFX_PEER_IDLE_PROBE_MS (500 ms)
++ * is left to the peer until it is 100 ms old, and idle mode ends when the
++ * peer completes one itself or a flush blocks. So a
 + * presenting peer is flushed by the run side for at most about half a second
-+ * after it resumes (12-13 frames at 24 fps, measured). Measured (nvvfx-harness
++ * after it resumes (9-12 frames at 24 fps, measured). Measured (nvvfx-harness
 + * "vo", 25 s at 4K -> 8K with the run side flushing every put at once while
 + * the peer presents at 24, 60 and 20 Hz): those flushes take a median 0.00 ms,
 + * worst 0.2-0.3 ms, and another thread's waits for the peer's lock stay at a
@@ -4342,12 +4359,12 @@ index 0000000..2ca7563
 +/* The three in order, timed into the xfer's stats. */
 +int nvvfx_xfer_run(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms);
 +/* The run side's flush policy (the defaults are the core's; for tests): a put
-+ * after_ms old and not complete is flushed by the run side; a quick such
-+ * flush enters idle mode (idle_after_ms >= 0; < 0 disables it), in which a put
-+ * is flushed once it is idle_after_ms old, except one in every probe_ms,
-+ * which is waited for as normal; idle mode is left when such a probe
-+ * completes without the run side's flush, or when a flush takes longer than
-+ * blocked_ms. Resets the mode. */
++ * the run side has waited after_ms for (< 0: never) is flushed by it; a
++ * quick such flush enters idle mode (idle_after_ms >= 0; < 0 disables it), in
++ * which a pending put is flushed once it is idle_after_ms old, except one in
++ * every probe_ms, which is waited for as normal; idle mode is left when such
++ * a probe completes without the run side's flush, or when a flush takes
++ * longer than blocked_ms. Resets the mode. */
 +void nvvfx_xfer_set_peer_flush(nvvfx_xfer *x, double after_ms, double idle_after_ms, double probe_ms,
 +                               double blocked_ms);
 +/* Counts since creation: flushes of the peer, idle-mode entries and exits. */
@@ -4713,10 +4730,10 @@ index 0000000..9939e9e
 +#endif
 diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
 new file mode 100644
-index 0000000..b74a898
+index 0000000..523b5b3
 --- /dev/null
 +++ b/video/filter/vf_nvvfx.c
-@@ -0,0 +1,2628 @@
+@@ -0,0 +1,2633 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -4786,7 +4803,10 @@ index 0000000..b74a898
 + *    for either thread: each finishes what it is doing on its own, gives back
 + *    what it holds and exits; mp_destroy() drains them (vf_nvvfx_drain).
 + *  - Pipelines are never destroyed. NVIDIA's 1.3 SDK does not give back the
-+ *    GPU memory of an effect instance destroyed while any other exists, so
++ *    GPU memory of an effect instance once it is destroyed, while others exist
++ *    or not: destroying every pipeline and the private device too gave back
++ *    only this filter's own textures (2.8 GB of 16.1 GB at 8K, nvvfx-harness
++ *    "purge"), and a pipeline made afterwards took new memory on top. So
 + *    every pipeline goes into a process-wide cache when its filter is done
 + *    with it, and the next filter that needs the same kind borrows it (a
 + *    toggle off/on, or the next film of the same size, loads nothing). The
@@ -4842,8 +4862,10 @@ index 0000000..b74a898
 +// GPU memory that must be left on the adapter before another model is loaded
 +// (a new pipeline, or a level a pipeline has not run before): the SDK keeps
 +// every model it loads until the process exits, and running short of memory
-+// shows up as paging stalls of seconds. The larger figure applies when the
-+// output is larger than 3840x2160.
++// shows up as paging stalls of seconds; run on past the card (37.8 GB of this
++// process on a 24 GB card, in the harness) the SDK hit a CUDA illegal address
++// and the driver reset. The larger figure applies when the output is larger
++// than 3840x2160.
 +#define NVVFX_MEM_RESERVE_MB     3072
 +#define NVVFX_MEM_RESERVE_MB_8K  5120
 +
