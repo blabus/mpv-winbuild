@@ -745,7 +745,7 @@ jobs:
             note+="**Compiler**: ${{ inputs.compiler }}\n";
             note+="**Build Details**: https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}\n";
             note+="**Fork commit**: https://github.com/${{github.repository}}/commit/${{github.sha}}\n";
-            note+="**mpv-winbuild-cmake**: https://github.com/shinchiro/mpv-winbuild-cmake/commit/${process.env.CMAKE_REF}\n";
+            note+="**mpv-winbuild-cmake**: https://github.com/shinchiro/mpv-winbuild-cmake/commit/${{ env.CMAKE_REF }}\n";
             note+="**Dependency versions**: versions-*.txt in this release\n";
             const patch_note = `${{ needs.params.outputs.patch_note }}` ;
             if (patch_note) {
