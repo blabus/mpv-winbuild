@@ -134,10 +134,10 @@ index 0000000..6fbeacf
 +Write-Host "wrote $out using $Fxc"
 diff --git a/video/filter/nvvfx_core.c b/video/filter/nvvfx_core.c
 new file mode 100644
-index 0000000..8290b15
+index 0000000..17c1f7a
 --- /dev/null
 +++ b/video/filter/nvvfx_core.c
-@@ -0,0 +1,3525 @@
+@@ -0,0 +1,3537 @@
 +/*
 + * nvvfx_core.c - see nvvfx_core.h.
 + *
@@ -546,7 +546,18 @@ index 0000000..8290b15
 +    nvvfx_log_fn fn;
 +    void *ctx;
 +    nvvfx_error *err;   /* where failures are recorded; may be NULL */
++    int thread_err;     /* record them in nv_thread_err instead (the runtime's) */
 +};
++
++/* The runtime's last error is per thread (nvvfx_runtime_last_error): a
++ * pipeline creation on one thread reads it to decide its fallbacks, and a run
++ * or a creation on another thread must not overwrite it meanwhile. */
++#if defined(_MSC_VER) && !defined(__clang__)
++#define NV_THREAD_LOCAL __declspec(thread)
++#else
++#define NV_THREAD_LOCAL _Thread_local
++#endif
++static NV_THREAD_LOCAL nvvfx_error nv_thread_err;
 +
 +static void log_line(const struct nv_log *lg, int level, const char *msg)
 +{
@@ -570,13 +581,15 @@ index 0000000..8290b15
 +                  const char *fmt, va_list ap)
 +{
 +    char buf[384];
++    nvvfx_error *e;
 +    vsnprintf(buf, sizeof(buf), fmt, ap);
 +    buf[sizeof(buf) - 1] = 0;
-+    if (lg && lg->err) {
-+        lg->err->code = code;
-+        lg->err->sdk_status = sdk_status;
-+        lg->err->refused = refused;
-+        str_copy(lg->err->msg, sizeof(lg->err->msg), buf);
++    e = !lg ? NULL : lg->thread_err ? &nv_thread_err : lg->err;
++    if (e) {
++        e->code = code;
++        e->sdk_status = sdk_status;
++        e->refused = refused;
++        str_copy(e->msg, sizeof(e->msg), buf);
 +    }
 +    log_line(lg, level, buf);
 +    return code;
@@ -706,7 +719,6 @@ index 0000000..8290b15
 +
 +struct nvvfx_runtime {
 +    struct nv_log lg;
-+    nvvfx_error err;
 +    nvvfx_runtime_info info;
 +    char *effects;
 +    volatile LONG pipelines;       /* Interlocked: creation and destruction may run on different threads */
@@ -1193,7 +1205,7 @@ index 0000000..8290b15
 +        return NULL;
 +    }
 +    rt->lg = lg0;
-+    rt->lg.err = &rt->err;
++    rt->lg.thread_err = 1;
 +    if (!runtime_open(rt, &f)) {
 +        runtime_free_modules(rt);
 +        free(rt);
@@ -1242,13 +1254,13 @@ index 0000000..8290b15
 +
 +const nvvfx_error *nvvfx_runtime_last_error(const nvvfx_runtime *rt)
 +{
-+    return rt ? &rt->err : NULL;
++    return rt ? &nv_thread_err : NULL;
 +}
 +
 +void nvvfx_runtime_clear_error(nvvfx_runtime *rt)
 +{
 +    if (rt)
-+        memset(&rt->err, 0, sizeof(rt->err));
++        memset(&nv_thread_err, 0, sizeof(nv_thread_err));
 +}
 +
 +int nvvfx_runtime_set_sdk_log(nvvfx_runtime *rt, int verbosity)
@@ -2033,7 +2045,7 @@ index 0000000..8290b15
 +        bind |= D3D11_BIND_UNORDERED_ACCESS;
 +        p->rp = repack_create(p->dev, &rt->lg);
 +        if (!p->rp)
-+            return rt->err.code ? rt->err.code : NVVFX_E_D3D;
++            return nv_thread_err.code ? nv_thread_err.code : NVVFX_E_D3D;
 +    }
 +    r = make_texture(p->dev, &rt->lg, p->info.in_w, p->info.in_h, fmt, bind, &p->tx_in);
 +    if (!r)
@@ -2105,7 +2117,7 @@ index 0000000..8290b15
 +/*
 + * Create, configure, load and run once one VideoSuperRes instance.
 + * Returns 0 on success, 1 if the SDK refused the configuration (recorded in
-+ * rt->err, logged at `level`), negative on a failure that is not a refusal.
++ * the thread's runtime error, logged at `level`), negative on a failure that is not a refusal.
 + *
 + * Call order (NVIDIA's 1.3 sample; Verified (1.3 runtime), and the feature
 + * DLL's own messages require ImageEncodingMode before the images and Load):
@@ -2294,7 +2306,7 @@ index 0000000..8290b15
 +{
 +    nvvfx_runtime *rt = p->rt;
 +    static const DXGI_FORMAT word_formats[2] = {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UINT};
-+    char why[sizeof(rt->err.msg)] = "";
++    char why[sizeof(nv_thread_err.msg)] = "";
 +    int r, i;
 +
 +    if (p->cfg.transport == NVVFX_TRANSPORT_DIRECT)
@@ -2304,7 +2316,7 @@ index 0000000..8290b15
 +        r = transport_init(p, &transport_direct, DXGI_FORMAT_R10G10B10A2_UNORM, NVVFX_LOG_DEBUG);
 +        if (!r)
 +            return NVVFX_OK;
-+        str_copy(why, sizeof(why), rt->err.msg);
++        str_copy(why, sizeof(why), nv_thread_err.msg);
 +        transport_uninit(p);
 +        logm(&rt->lg, NVVFX_LOG_INFO, "direct transport unavailable (%s); using r32", why);
 +    }
@@ -2312,7 +2324,7 @@ index 0000000..8290b15
 +        r = transport_init(p, &transport_r32, word_formats[i], i ? NVVFX_LOG_ERROR : NVVFX_LOG_DEBUG);
 +        if (!r)
 +            return NVVFX_OK;
-+        str_copy(why, sizeof(why), rt->err.msg);
++        str_copy(why, sizeof(why), nv_thread_err.msg);
 +        transport_uninit(p);
 +        if (!i)
 +            logm(&rt->lg, NVVFX_LOG_INFO, "r32 transport: R32_UINT unusable (%s); trying "
@@ -2333,7 +2345,7 @@ index 0000000..8290b15
 +
 +    if (!rt)
 +        return NULL;
-+    memset(&rt->err, 0, sizeof(rt->err));
++    memset(&nv_thread_err, 0, sizeof(nv_thread_err));
 +    if (!dev || !cfg) {
 +        fail(&rt->lg, NVVFX_E_ARG, "nvvfx_pipeline_create: NULL device or config");
 +        return NULL;
@@ -2394,9 +2406,9 @@ index 0000000..8290b15
 +        if (r < 0 || (r > 0 && cfg->exact))
 +            goto fail;
 +        if (r > 0) {
-+            snprintf(p->info.fallback, sizeof(p->info.fallback), "deblur dropped: %s", rt->err.msg);
++            snprintf(p->info.fallback, sizeof(p->info.fallback), "deblur dropped: %s", nv_thread_err.msg);
 +            logm(&rt->lg, NVVFX_LOG_WARN, "deblur (QualityLevel %u) refused, continuing without it: %s",
-+                 NV_QL_DEBLUR(cfg->deblur_level), rt->err.msg);
++                 NV_QL_DEBLUR(cfg->deblur_level), nv_thread_err.msg);
 +            free_buffer(p, &p->buf_deb);
 +        } else {
 +            p->final = &p->buf_deb;
@@ -2450,17 +2462,17 @@ index 0000000..8290b15
 +                free_buffer(p, &p->buf_up);
 +                if (r < 0 || cfg->exact)
 +                    goto fail;
-+            } else if (cfg->exact || !rt->err.refused) {
++            } else if (cfg->exact || !nv_thread_err.refused) {
 +                goto fail;
 +            }
 +            snprintf(one, sizeof(one), "%s%dx%d", tried[0] ? ", " : "", cw[i], ch[i]);
 +            str_cat(tried, sizeof(tried), one);
-+            if (status_not_size_related(rt->err.sdk_status))
++            if (status_not_size_related(nv_thread_err.sdk_status))
 +                break;
 +        }
 +        if (!p->st[1].live) {
 +            char msg[sizeof(p->info.fallback)];
-+            snprintf(msg, sizeof(msg), "upscale refused at %s; no upscale (%s)", tried, rt->err.msg);
++            snprintf(msg, sizeof(msg), "upscale refused at %s; no upscale (%s)", tried, nv_thread_err.msg);
 +            logm(&rt->lg, NVVFX_LOG_WARN, "%s", msg);
 +            if (p->info.fallback[0])
 +                str_cat(p->info.fallback, sizeof(p->info.fallback), "; ");
@@ -2468,7 +2480,7 @@ index 0000000..8290b15
 +        } else if (tried[0]) {
 +            char msg[sizeof(p->info.fallback)];
 +            snprintf(msg, sizeof(msg), "upscale refused at %s; using %dx%d (%s)", tried,
-+                     p->info.out_w, p->info.out_h, rt->err.msg);
++                     p->info.out_w, p->info.out_h, nv_thread_err.msg);
 +            logm(&rt->lg, NVVFX_LOG_WARN, "%s", msg);
 +            if (p->info.fallback[0])
 +                str_cat(p->info.fallback, sizeof(p->info.fallback), "; ");
@@ -2528,14 +2540,14 @@ index 0000000..8290b15
 +             p->info.out_h, deb, up, p->tp->name, dxgi_format_name(p->tx_format),
 +             p->info.cuda_device, p->adapter);
 +    }
-+    memset(&rt->err, 0, sizeof(rt->err));
++    memset(&nv_thread_err, 0, sizeof(nv_thread_err));
 +    return p;
 +
 +fail:
 +    {
-+        nvvfx_error keep = rt->err;
++        nvvfx_error keep = nv_thread_err;
 +        nvvfx_pipeline_destroy(p);
-+        rt->err = keep;
++        nv_thread_err = keep;
 +    }
 +    return NULL;
 +}
@@ -2755,7 +2767,7 @@ index 0000000..8290b15
 +            return fail(&rt->lg, NVVFX_E_ARG, "strength %.3f out of 0..1", v[i]);
 +    }
 +    if (cuda_select(p))
-+        return rt->err.code;
++        return nv_thread_err.code;
 +    for (i = 0; i < 2; i++) {
 +        NvCV_Status st;
 +        if (!(v[i] >= 0.0f) || !p->st[i].live || v[i] == p->st[i].strength)
@@ -2794,7 +2806,7 @@ index 0000000..8290b15
 +    }
 +    changed = 0;
 +    if (cuda_select(p))
-+        return rt->err.code;
++        return nv_thread_err.code;
 +    for (i = 0; i < 2; i++) {
 +        const char *name = i ? "upscale" : "deblur";
 +        unsigned q;
@@ -2845,7 +2857,7 @@ index 0000000..8290b15
 +    if (p->broken)
 +        return NVVFX_E_BROKEN;
 +    if (cuda_select(p))
-+        return rt->err.code;
++        return nv_thread_err.code;
 +    for (i = 0; i < 2; i++) {
 +        NvCV_Status st;
 +        if (!p->st[i].live)
@@ -2902,11 +2914,11 @@ index 0000000..8290b15
 +    cfg.in_h = 360;
 +    cfg.deblur_level = 1;
 +    cfg.exact = 1;
-+    keep = rt->err;
++    keep = nv_thread_err;
 +    rt->warm = nvvfx_pipeline_create(rt, dev, &cfg);
 +    if (!rt->warm)
-+        return rt->err.code ? rt->err.code : NVVFX_E_SDK;
-+    rt->err = keep;
++        return nv_thread_err.code ? nv_thread_err.code : NVVFX_E_SDK;
++    nv_thread_err = keep;
 +    rt->warm_dev = dev;
 +    logm(&rt->lg, NVVFX_LOG_DEBUG, "keeping the SDK warm with a 640x360 deblur instance");
 +    return NVVFX_OK;
@@ -3665,7 +3677,7 @@ index 0000000..8290b15
 +}
 diff --git a/video/filter/nvvfx_core.h b/video/filter/nvvfx_core.h
 new file mode 100644
-index 0000000..309d01f
+index 0000000..1414c03
 --- /dev/null
 +++ b/video/filter/nvvfx_core.h
 @@ -0,0 +1,535 @@
@@ -3761,8 +3773,8 @@ index 0000000..309d01f
 + * Errors: every failure produces exactly one log line (with the SDK's own error
 + * string when it has one) and a negative NVVFX_E_* code; nothing crashes, and a
 + * run never returns with a resource still mapped. The last error is kept in
-+ * nvvfx_runtime_last_error(), which is shared by every pipeline of the runtime:
-+ * with calls on several threads, rely on the log line instead.
++ * nvvfx_runtime_last_error(), per thread: each thread sees the error of its
++ * own last failing call, whatever other threads do meanwhile.
 + */
 +
 +#ifndef MP_NVVFX_CORE_H
@@ -4523,10 +4535,10 @@ index 0000000..9939e9e
 +#endif
 diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
 new file mode 100644
-index 0000000..e0a62a4
+index 0000000..28aaa89
 --- /dev/null
 +++ b/video/filter/vf_nvvfx.c
-@@ -0,0 +1,2533 @@
+@@ -0,0 +1,2625 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -4677,6 +4689,10 @@ index 0000000..e0a62a4
 +#define NVVFX_STALL_MS 10000
 +// How often the worker looks for a stalled frame.
 +#define NVVFX_WATCH_MS 250
++// How long a build waits for a pipeline of its kind that another filter has
++// let go of but that its runner has not given back yet (an instance replaced
++// quickly: a toggle off and on), rather than make a second one.
++#define NVVFX_RETURN_WAIT_MS 500
 +
 +#define NVVFX_PTS_RING 64
 +#define NVVFX_LAT_RING 64
@@ -4740,6 +4756,7 @@ index 0000000..e0a62a4
 +
 +    // --- protected by nv_cache_lock
 +    bool in_use;                        // lent to a filter
++    bool returning;                     // lent, and given back once its runner is done
 +    bool dead;                          // failed: never lent again
 +
 +    // --- set at creation, then read-only
@@ -4756,6 +4773,7 @@ index 0000000..e0a62a4
 +};
 +
 +static mp_static_mutex nv_cache_lock = MP_STATIC_MUTEX_INITIALIZER;
++static mp_cond nv_cache_cond = MP_STATIC_COND_INITIALIZER;  // an entry was given back
 +static struct cached *nv_cache;
 +
 +// ===========================================================================
@@ -5194,6 +5212,7 @@ index 0000000..e0a62a4
 +    for (struct cached *e = nv_cache; e; e = e->next) {
 +        if (!e->in_use && !e->dead && entry_matches(e, pdev, s)) {
 +            e->in_use = true;
++            e->returning = false;
 +            found = e;
 +            break;
 +        }
@@ -5202,12 +5221,58 @@ index 0000000..e0a62a4
 +    return found;
 +}
 +
++// The same, but if a pipeline of this kind is on its way back (see
++// cache_mark_returning), wait up to NVVFX_RETURN_WAIT_MS for it. Worker only,
++// never the playloop.
++static struct cached *cache_borrow_wait(nvvfx_device *pdev, const struct shape *s)
++{
++    int64_t until = mp_time_ns_add(mp_time_ns(), NVVFX_RETURN_WAIT_MS / 1000.0);
++    struct cached *found = NULL;
++    bool timed_out = false;
++    if (!pdev)
++        return NULL;
++    mp_mutex_lock(&nv_cache_lock);
++    for (;;) {
++        bool coming = false;
++        for (struct cached *e = nv_cache; e; e = e->next) {
++            if (e->dead || !entry_matches(e, pdev, s))
++                continue;
++            if (!e->in_use) {
++                e->in_use = true;
++                e->returning = false;
++                found = e;
++                break;
++            }
++            if (e->returning)
++                coming = true;
++        }
++        if (found || !coming || timed_out)
++            break;
++        timed_out = mp_cond_timedwait_until(&nv_cache_cond, &nv_cache_lock, until) != 0;
++    }
++    mp_mutex_unlock(&nv_cache_lock);
++    return found;
++}
++
++// A pipeline its filter has let go of while that filter's runner is still on
++// a frame of it: it is given back when the runner is done.
++static void cache_mark_returning(struct cached *e)
++{
++    if (!e)
++        return;
++    mp_mutex_lock(&nv_cache_lock);
++    e->returning = true;
++    mp_mutex_unlock(&nv_cache_lock);
++}
++
 +static void cache_return(struct cached *e)
 +{
 +    if (!e)
 +        return;
 +    mp_mutex_lock(&nv_cache_lock);
 +    e->in_use = false;
++    e->returning = false;
++    mp_cond_broadcast(&nv_cache_cond);
 +    mp_mutex_unlock(&nv_cache_lock);
 +}
 +
@@ -5220,6 +5285,8 @@ index 0000000..e0a62a4
 +    mp_mutex_lock(&nv_cache_lock);
 +    e->dead = true;
 +    e->in_use = false;
++    e->returning = false;
++    mp_cond_broadcast(&nv_cache_cond);
 +    mp_mutex_unlock(&nv_cache_lock);
 +}
 +
@@ -5291,6 +5358,7 @@ index 0000000..e0a62a4
 +    }
 +    if (l->busy && l->num_releases < (int)MP_ARRAY_SIZE(l->releases)) {
 +        l->releases[l->num_releases++] = r;
++        cache_mark_returning(e);
 +        now = false;
 +    } else if (l->busy) {
 +        // (Cannot happen: a filter holds one pipeline and one in reserve.)
@@ -5403,7 +5471,7 @@ index 0000000..e0a62a4
 +    if (!pdev)
 +        return;
 +
-+    res->entry = cache_borrow(pdev, &job->shape);
++    res->entry = cache_borrow_wait(pdev, &job->shape);
 +    if (res->entry)
 +        return;
 +
@@ -5579,37 +5647,45 @@ index 0000000..e0a62a4
 +        l->warned_mem = true;
 +        ul = 0;
 +    }
-+    if (dl || ul) {
-+        int r = nvvfx_pipeline_set_levels(e->pl, dl ? dl : -1, ul ? ul : -1);
++    // One stage per call: the core applies each stage on its own and answers
++    // 0 when either was refused, so a call for both could not say which one
++    // went through.
++    bool levels_changed = false;
++    for (int i = 0; i < 2; i++) {
++        int lv = i ? ul : dl;
++        if (!lv)
++            continue;
++        int r = i ? nvvfx_pipeline_set_levels(e->pl, -1, lv)
++                  : nvvfx_pipeline_set_levels(e->pl, lv, -1);
 +        if (r < 0)
 +            return r;
 +        if (r == 0) {
-+            // The SDK refused (logged by the core): keep the levels in force.
++            // The SDK refused (logged by the core): keep the level in force.
 +            if (!l->warned_refused)
 +                link_log(l, MSGL_WARN, "The level change was refused; keeping the current levels.");
 +            l->warned_refused = true;
-+            if (dl) {
-+                l->deb_held = dl;
++            if (i) {
++                l->up_held = lv;
++                l->up_held_mem = false;
++            } else {
++                l->deb_held = lv;
 +                l->deb_held_mem = false;
 +            }
-+            if (ul) {
-+                l->up_held = ul;
-+                l->up_held_mem = false;
-+            }
 +        } else {
-+            if (dl) {
-+                e->deblur_level = dl;
-+                e->deblur_used |= 1u << dl;
++            if (i) {
++                e->up_level = lv;
++                e->up_used |= 1u << lv;
++            } else {
++                e->deblur_level = lv;
++                e->deblur_used |= 1u << lv;
 +            }
-+            if (ul) {
-+                e->up_level = ul;
-+                e->up_used |= 1u << ul;
-+            }
-+            link_log(l, MSGL_V, "Levels changed live: deblur %s, upscale %s.",
-+                     e->deblur_live ? m_opt_choice_str(deblur_names, e->deblur_level) : "off",
-+                     e->up_live ? m_opt_choice_str(deblur_names, e->up_level) : "off");
++            levels_changed = true;
 +        }
 +    }
++    if (levels_changed)
++        link_log(l, MSGL_V, "Levels changed live: deblur %s, upscale %s.",
++                 e->deblur_live ? m_opt_choice_str(deblur_names, e->deblur_level) : "off",
++                 e->up_live ? m_opt_choice_str(deblur_names, e->up_level) : "off");
 +
 +    // Strengths: free to change.
 +    float ds = e->deblur_live && want->deblur > 0 ? want->deblur_strength : -1.0f;
@@ -5619,27 +5695,36 @@ index 0000000..e0a62a4
 +        ds = -1.0f;
 +    if (us == e->up_str || us == l->up_str_held)
 +        us = -1.0f;
-+    if (ds >= 0 || us >= 0) {
-+        int r = nvvfx_pipeline_set_strength(e->pl, ds, us);
++    bool strengths_changed = false;
++    for (int i = 0; i < 2; i++) {
++        float st = i ? us : ds;
++        if (!(st >= 0))
++            continue;
++        int r = i ? nvvfx_pipeline_set_strength(e->pl, -1.0f, st)
++                  : nvvfx_pipeline_set_strength(e->pl, st, -1.0f);
 +        if (r < 0)
 +            return r;
 +        if (r == 0) {
 +            if (!l->warned_refused)
 +                link_log(l, MSGL_WARN, "The strength change was refused; keeping the current strengths.");
 +            l->warned_refused = true;
-+            if (ds >= 0)
-+                l->deb_str_held = ds;
-+            if (us >= 0)
-+                l->up_str_held = us;
++            if (i) {
++                l->up_str_held = st;
++            } else {
++                l->deb_str_held = st;
++            }
 +        } else {
-+            if (ds >= 0)
-+                e->deblur_str = ds;
-+            if (us >= 0)
-+                e->up_str = us;
-+            link_log(l, MSGL_V, "Strengths changed live: deblur %.2f, upscale %.2f.",
-+                     e->deblur_str, e->up_str);
++            if (i) {
++                e->up_str = st;
++            } else {
++                e->deblur_str = st;
++            }
++            strengths_changed = true;
 +        }
 +    }
++    if (strengths_changed)
++        link_log(l, MSGL_V, "Strengths changed live: deblur %.2f, upscale %.2f.",
++                 e->deblur_str, e->up_str);
 +    return 1;
 +}
 +
@@ -6096,11 +6181,21 @@ index 0000000..e0a62a4
 +    struct priv *p = f->priv;
 +    struct link *l = p->link;
 +    mp_mutex_lock(&l->lock);
++    // (The worker looks every NVVFX_WATCH_MS, but not while it is inside a
++    // creation; this looks whenever process() runs.)
++    if (l->busy && !l->stall_reported &&
++        mp_time_ns() - l->busy_since > MP_TIME_MS_TO_NS(NVVFX_STALL_MS))
++    {
++        l->stalled = true;
++        l->stall_reported = true;
++    }
 +    bool stalled = l->stalled;
 +    l->stalled = false;
-+    if (stalled && !p->broken) {
++    if (stalled) {
 +        // The running frame leaves unprocessed; the runner's result for it,
 +        // if it ever comes, is dropped (find_job sees it is not running).
++        // Also when the filter has given up already: the frames behind it
++        // would otherwise wait for it for good.
 +        for (int n = 0; n < l->count; n++) {
 +            struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
 +            if (j->state == JOB_RUNNING) {
@@ -6374,15 +6469,24 @@ index 0000000..e0a62a4
 +    mp_mutex_unlock(&l->lock);
 +    p->slot_busy[slot] = true;
 +    p->inflight++;
++    p->want_release = false;    // it is in use again
 +}
 +
 +// The bookkeeping of a frame taken in.
 +static bool took(struct priv *p, struct mp_image *in)
 +{
-+    p->last_in_w = in->w;
-+    p->last_in_h = in->h;
 +    note_pts(p, in);
 +    return true;
++}
++
++// The sizes the metadata reports: those of the last frame sent on, in and
++// out as a pair.
++static void sent(struct priv *p, struct mp_image *in, int out_w, int out_h)
++{
++    p->last_in_w = in->w;
++    p->last_in_h = in->h;
++    p->last_out_w = out_w;
++    p->last_out_h = out_h;
 +}
 +
 +// Take a frame in. Returns false if it was put back (it waits for a switch of
@@ -6575,9 +6679,10 @@ index 0000000..e0a62a4
 +
 +    if (!j.process) {
 +        if (j.img) {
-+            set_passthrough(p, j.detail);
-+            p->last_out_w = j.img->w;
-+            p->last_out_h = j.img->h;
++            // (After a give-up its reason stays, not this frame's older one.)
++            if (!p->broken)
++                set_passthrough(p, j.detail);
++            sent(p, j.img, j.img->w, j.img->h);
 +            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
 +        }
 +        return true;
@@ -6595,8 +6700,7 @@ index 0000000..e0a62a4
 +    if (j.status != NVVFX_OK || p->broken || !p->cur) {
 +        frame_left(p, j.slot);
 +        set_passthrough(p, p->detail[0] ? p->detail : "passing through");
-+        p->last_out_w = j.img->w;
-+        p->last_out_h = j.img->h;
++        sent(p, j.img, j.img->w, j.img->h);
 +        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
 +        return true;
 +    }
@@ -6617,13 +6721,13 @@ index 0000000..e0a62a4
 +        talloc_free(out);
 +        give_up(f, false, err, "Copying a frame from the NVIDIA device failed: %s", err);
 +        frame_left(p, j.slot);
-+        p->last_out_w = j.img->w;
-+        p->last_out_h = j.img->h;
++        sent(p, j.img, j.img->w, j.img->h);
 +        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
 +        return true;
 +    }
 +    mp_image_set_size(out, e->out_w, e->out_h);
 +    set_out_attributes(out, j.img);
++    sent(p, j.img, out->w, out->h);
 +    talloc_free(j.img);
 +
 +    set_active(p);
@@ -6631,8 +6735,6 @@ index 0000000..e0a62a4
 +    const char *notice = mem_notice(p, p->have_last_want ? &p->last_want : NULL);
 +    if (notice)
 +        snprintf(p->detail, sizeof(p->detail), "%s", notice);
-+    p->last_out_w = out->w;
-+    p->last_out_h = out->h;
 +    p->latency[p->pos_lat] = MP_TIME_NS_TO_MS(mp_time_ns() - j.t_queued);
 +    p->pos_lat = (p->pos_lat + 1) % NVVFX_LAT_RING;
 +    if (p->num_lat < NVVFX_LAT_RING)
@@ -6890,8 +6992,10 @@ index 0000000..e0a62a4
 +        struct release r = {.entry = p->cur, .peer = p->peer};
 +        bool later = (p->cur || p->peer) && l->busy && p->runner_ok &&
 +                     l->num_releases < (int)MP_ARRAY_SIZE(l->releases);
-+        if (later)
++        if (later) {
 +            l->releases[l->num_releases++] = r;
++            cache_mark_returning(p->cur);
++        }
 +        bool leak = (p->cur || p->peer) && l->busy && !later;
 +        mp_cond_signal(&l->cond);
 +        mp_cond_signal(&l->run_cond);
