@@ -134,10 +134,10 @@ index 0000000..6fbeacf
 +Write-Host "wrote $out using $Fxc"
 diff --git a/video/filter/nvvfx_core.c b/video/filter/nvvfx_core.c
 new file mode 100644
-index 0000000..10aa217
+index 0000000..8290b15
 --- /dev/null
 +++ b/video/filter/nvvfx_core.c
-@@ -0,0 +1,2754 @@
+@@ -0,0 +1,3525 @@
 +/*
 + * nvvfx_core.c - see nvvfx_core.h.
 + *
@@ -1697,6 +1697,8 @@ index 0000000..10aa217
 +    cudaEvent_t ev[8];
 +    int have_events;
 +    int ev_pending;                /* timing EVENTS: the last run's events are still to be read */
++    CRITICAL_SECTION stats_lock;   /* the rings: stats may be read while a run is in progress */
++    int stats_lock_ok;
 +    struct ring wall[NVVFX_STAGE_COUNT];
 +    struct ring gpu[NVVFX_STAGE_COUNT];
 +
@@ -1734,6 +1736,9 @@ index 0000000..10aa217
 +    case NVVFX_E_UNSUPPORTED:  return "unsupported";
 +    case NVVFX_E_BROKEN:       return "pipeline unusable, recreate it";
 +    case NVVFX_E_RUNTIME:      return "runtime not found or incomplete";
++    case NVVFX_E_TIMEOUT:      return "the GPU did not finish in time";
++    case NVVFX_E_LOST:         return "the NVIDIA device was removed (GPU reset)";
++    case NVVFX_E_PEER_LOST:    return "the video device was removed";
 +    default:                   return "unknown error";
 +    }
 +}
@@ -1757,6 +1762,13 @@ index 0000000..10aa217
 +{
 +    double x = *(const double *)a, y = *(const double *)b;
 +    return (x > y) - (x < y);
++}
++
++static void stats_push(nvvfx_pipeline *p, struct ring *r, double v)
++{
++    EnterCriticalSection(&p->stats_lock);
++    ring_push(r, v);
++    LeaveCriticalSection(&p->stats_lock);
 +}
 +
 +static void ring_stats(const struct ring *r, int *count, double *median, double *p99,
@@ -2336,6 +2348,8 @@ index 0000000..10aa217
 +    }
 +    p->rt = rt;
 +    InterlockedIncrement(&rt->pipelines);
++    InitializeCriticalSection(&p->stats_lock);
++    p->stats_lock_ok = 1;
 +    p->cfg = *cfg;
 +    p->dev = dev;
 +    ID3D11Device_AddRef(dev);
@@ -2561,6 +2575,8 @@ index 0000000..10aa217
 +        ID3D11DeviceContext_Release(p->ctx);
 +    if (p->dev)
 +        ID3D11Device_Release(p->dev);
++    if (p->stats_lock_ok)
++        DeleteCriticalSection(&p->stats_lock);
 +    InterlockedDecrement(&rt->pipelines);
 +    free(p);
 +}
@@ -2628,12 +2644,12 @@ index 0000000..10aa217
 +        if ((i == 1 && !p->st[0].live) || (i == 2 && !p->st[1].live))
 +            continue;
 +        if (rt->cu.EventElapsedTime(&ms, p->ev[2 * i], p->ev[2 * i + 1]) == 0)
-+            ring_push(&p->gpu[stage_of[i]], ms);
++            stats_push(p, &p->gpu[stage_of[i]], ms);
 +    }
 +    {
 +        float ms = 0;
 +        if (rt->cu.EventElapsedTime(&ms, p->ev[0], p->ev[7]) == 0)
-+            ring_push(&p->gpu[NVVFX_STAGE_TOTAL], ms);
++            stats_push(p, &p->gpu[NVVFX_STAGE_TOTAL], ms);
 +    }
 +}
 +
@@ -2683,7 +2699,7 @@ index 0000000..10aa217
 +    if (r)
 +        return r;
 +    if (timing)
-+        ring_push(&p->wall[NVVFX_STAGE_IN], now_ms() - t0);
++        stats_push(p, &p->wall[NVVFX_STAGE_IN], now_ms() - t0);
 +
 +    /* the effects */
 +    for (i = 0; i < 2; i++) {
@@ -2700,7 +2716,7 @@ index 0000000..10aa217
 +        if (r)
 +            return r;
 +        if (timing)
-+            ring_push(&p->wall[NVVFX_STAGE_DEBLUR + i], now_ms() - ts);
++            stats_push(p, &p->wall[NVVFX_STAGE_DEBLUR + i], now_ms() - ts);
 +    }
 +
 +    /* transfer out */
@@ -2712,9 +2728,9 @@ index 0000000..10aa217
 +        return r;
 +    if (timing) {
 +        d3d_wait(p);
-+        ring_push(&p->wall[NVVFX_STAGE_OUT], now_ms() - ts);
++        stats_push(p, &p->wall[NVVFX_STAGE_OUT], now_ms() - ts);
 +    }
-+    ring_push(&p->wall[NVVFX_STAGE_TOTAL], now_ms() - t0);
++    stats_push(p, &p->wall[NVVFX_STAGE_TOTAL], now_ms() - t0);
 +    if (timing && p->have_events)
 +        harvest_gpu(p);
 +    if (events)
@@ -2764,7 +2780,7 @@ index 0000000..10aa217
 +{
 +    nvvfx_runtime *rt;
 +    int lv[2];
-+    int i, all = 1;
++    int i, all = 1, changed;
 +    if (!p)
 +        return NVVFX_E_ARG;
 +    rt = p->rt;
@@ -2776,6 +2792,7 @@ index 0000000..10aa217
 +        if (lv[i] > 4)
 +            return fail(&rt->lg, NVVFX_E_ARG, "level %d (want 0..4)", lv[i]);
 +    }
++    changed = 0;
 +    if (cuda_select(p))
 +        return rt->err.code;
 +    for (i = 0; i < 2; i++) {
@@ -2807,6 +2824,13 @@ index 0000000..10aa217
 +            p->info.upscale_quality = q;
 +        else
 +            p->info.deblur_quality = q;
++        changed = 1;
++    }
++    /* The medians describe the levels in force: start them again, and drop
++     * the events of the last run (made at the old level) unread. */
++    if (changed) {
++        nvvfx_pipeline_reset_stats(p);
++        p->ev_pending = 0;
 +    }
 +    return all;
 +}
@@ -2843,18 +2867,22 @@ index 0000000..10aa217
 +    memset(out, 0, sizeof(*out));
 +    if (!p || stage < 0 || stage >= NVVFX_STAGE_COUNT)
 +        return;
++    EnterCriticalSection((CRITICAL_SECTION *)&p->stats_lock);
 +    ring_stats(&p->wall[stage], &out->count, &out->median_ms, &out->p99_ms, &out->max_ms,
 +               &out->last_ms);
 +    ring_stats(&p->gpu[stage], &out->gpu_count, &out->gpu_median_ms, &out->gpu_p99_ms,
 +               &out->gpu_max_ms, NULL);
++    LeaveCriticalSection((CRITICAL_SECTION *)&p->stats_lock);
 +}
 +
 +void nvvfx_pipeline_reset_stats(nvvfx_pipeline *p)
 +{
 +    if (!p)
 +        return;
++    EnterCriticalSection(&p->stats_lock);
 +    memset(p->wall, 0, sizeof(p->wall));
 +    memset(p->gpu, 0, sizeof(p->gpu));
++    LeaveCriticalSection(&p->stats_lock);
 +}
 +
 +/* ======================================================================== keep warm */
@@ -2892,12 +2920,755 @@ index 0000000..10aa217
 +    rt->warm = NULL;
 +    rt->warm_dev = NULL;
 +}
++
++/* ======================================================================== private device */
++
++static const GUID nv_iid_dxgi_factory1 =
++    {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
++static const GUID nv_iid_dxgi_resource =
++    {0x035f3ab4, 0x482e, 0x4e50, {0xb4, 0x1f, 0x8a, 0x7f, 0x8b, 0xd8, 0x96, 0x0b}};
++static const GUID nv_iid_texture2d =
++    {0x6f15aaf2, 0xd208, 0x4e89, {0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}};
++static const GUID nv_iid_keyed_mutex =
++    {0x9d8e1289, 0xd7b3, 0x465f, {0x81, 0x26, 0x25, 0x0e, 0x34, 0x9a, 0xf8, 0x5d}};
++
++typedef HRESULT (WINAPI *PFN_nv_CreateDXGIFactory1)(REFIID riid, void **factory);
++typedef HRESULT (WINAPI *PFN_nv_D3D11CreateDevice)(IDXGIAdapter *adapter, D3D_DRIVER_TYPE type,
++                                                  HMODULE software, UINT flags,
++                                                  const D3D_FEATURE_LEVEL *levels, UINT nlevels,
++                                                  UINT sdk_version, ID3D11Device **dev,
++                                                  D3D_FEATURE_LEVEL *level, ID3D11DeviceContext **ctx);
++
++struct nvvfx_device {
++    ID3D11Device *dev;
++    LUID luid;
++    char name[128];
++};
++
++static int luid_eq(const LUID *a, const LUID *b)
++{
++    return a->LowPart == b->LowPart && a->HighPart == b->HighPart;
++}
++
++int nvvfx_adapter_luid(ID3D11Device *dev, LUID *luid)
++{
++    IDXGIDevice *dxgi = NULL;
++    IDXGIAdapter *ad = NULL;
++    DXGI_ADAPTER_DESC d;
++    HRESULT hr;
++    if (!dev || !luid)
++        return NVVFX_E_ARG;
++    memset(&d, 0, sizeof(d));
++    hr = ID3D11Device_QueryInterface(dev, &nv_iid_dxgi_device, (void **)&dxgi);
++    if (SUCCEEDED(hr))
++        hr = IDXGIDevice_GetAdapter(dxgi, &ad);
++    if (SUCCEEDED(hr))
++        hr = IDXGIAdapter_GetDesc(ad, &d);
++    if (SUCCEEDED(hr))
++        *luid = d.AdapterLuid;
++    if (ad)
++        IDXGIAdapter_Release(ad);
++    if (dxgi)
++        IDXGIDevice_Release(dxgi);
++    return SUCCEEDED(hr) ? NVVFX_OK : NVVFX_E_D3D;
++}
++
++nvvfx_device *nvvfx_device_create(const LUID *luid, nvvfx_log_fn log_fn, void *log_ctx)
++{
++    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
++    struct nv_log lg = {log_fn, log_ctx, NULL};
++    PFN_nv_CreateDXGIFactory1 create_factory = NULL;
++    PFN_nv_D3D11CreateDevice create_device = NULL;
++    HMODULE dxgi_dll, d3d11_dll;
++    IDXGIFactory1 *fac = NULL;
++    IDXGIAdapter1 *ad = NULL, *found = NULL;
++    DXGI_ADAPTER_DESC1 desc, found_desc;
++    ID3D11Device *dev = NULL;
++    ID3D11DeviceContext *ctx = NULL;
++    ID3D10Multithread *mt = NULL;
++    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
++    nvvfx_device *d;
++    HRESULT hr;
++    UINT i;
++
++    if (!luid) {
++        fail(&lg, NVVFX_E_ARG, "nvvfx_device_create: no adapter LUID");
++        return NULL;
++    }
++    /* Both stay loaded: a process with a D3D11 device has them loaded anyway. */
++    dxgi_dll = LoadLibraryExW(L"dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    d3d11_dll = LoadLibraryExW(L"d3d11.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (!resolve(dxgi_dll, "CreateDXGIFactory1", &create_factory) ||
++        !resolve(d3d11_dll, "D3D11CreateDevice", &create_device)) {
++        fail(&lg, NVVFX_E_D3D, "private device: dxgi.dll/d3d11.dll do not export "
++             "CreateDXGIFactory1/D3D11CreateDevice");
++        return NULL;
++    }
++    hr = create_factory(&nv_iid_dxgi_factory1, (void **)&fac);
++    if (FAILED(hr)) {
++        d3d_fail(&lg, hr, "private device: CreateDXGIFactory1");
++        return NULL;
++    }
++    memset(&found_desc, 0, sizeof(found_desc));
++    for (i = 0; IDXGIFactory1_EnumAdapters1(fac, i, &ad) == S_OK; i++) {
++        if (!found && SUCCEEDED(IDXGIAdapter1_GetDesc1(ad, &desc)) &&
++            luid_eq(&desc.AdapterLuid, luid)) {
++            found = ad;
++            found_desc = desc;
++        } else {
++            IDXGIAdapter1_Release(ad);
++        }
++        ad = NULL;
++    }
++    IDXGIFactory1_Release(fac);
++    if (!found) {
++        fail(&lg, NVVFX_E_UNSUPPORTED, "private device: no adapter with LUID %08lx:%08lx",
++             (unsigned long)luid->HighPart, (unsigned long)luid->LowPart);
++        return NULL;
++    }
++    hr = create_device((IDXGIAdapter *)found, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags, levels, 2,
++                       D3D11_SDK_VERSION, &dev, NULL, &ctx);
++    if (FAILED(hr)) {
++        /* (the flags are the ones nvvfx-harness has always run with; a driver
++         * without video support still gets a device) */
++        flags = 0;
++        hr = create_device((IDXGIAdapter *)found, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags, levels, 2,
++                           D3D11_SDK_VERSION, &dev, NULL, &ctx);
++    }
++    IDXGIAdapter1_Release(found);
++    if (ctx)
++        ID3D11DeviceContext_Release(ctx);
++    if (FAILED(hr)) {
++        d3d_fail(&lg, hr, "private device: D3D11CreateDevice");
++        return NULL;
++    }
++    if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &nv_iid_multithread, (void **)&mt))) {
++        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
++        ID3D10Multithread_Release(mt);
++    }
++    d = calloc(1, sizeof(*d));
++    if (!d) {
++        ID3D11Device_Release(dev);
++        fail(&lg, NVVFX_E_NOMEM, "out of memory");
++        return NULL;
++    }
++    d->dev = dev;
++    d->luid = *luid;
++    utf8(d->name, sizeof(d->name), found_desc.Description);
++    logm(&lg, NVVFX_LOG_INFO, "private D3D11 device on %s (LUID %08lx:%08lx), feature level %x, "
++         "flags 0x%x", d->name, (unsigned long)luid->HighPart, (unsigned long)luid->LowPart,
++         (unsigned)ID3D11Device_GetFeatureLevel(dev), flags);
++    return d;
++}
++
++void nvvfx_device_destroy(nvvfx_device *d)
++{
++    if (!d)
++        return;
++    if (d->dev)
++        ID3D11Device_Release(d->dev);
++    free(d);
++}
++
++ID3D11Device *nvvfx_device_d3d11(const nvvfx_device *d)
++{
++    return d ? d->dev : NULL;
++}
++
++LUID nvvfx_device_luid(const nvvfx_device *d)
++{
++    LUID none = {0, 0};
++    return d ? d->luid : none;
++}
++
++const char *nvvfx_device_name(const nvvfx_device *d)
++{
++    return d ? d->name : "";
++}
++
++HRESULT nvvfx_device_removed_reason(const nvvfx_device *d)
++{
++    return d && d->dev ? ID3D11Device_GetDeviceRemovedReason(d->dev) : E_POINTER;
++}
++
++/* ======================================================================== cross-device transfer */
++
++/* With NVVFX_XFER_NO_FLUSH: how long a put may wait for the peer's own next
++ * submission before the run side flushes the peer itself (for a peer that has
++ * stopped submitting: a paused or idle VO). A presenting peer gets there
++ * first: its copies were measured complete within 95 ms at a 20 Hz present
++ * rate, and a flush while it presents would block (see the transfer notes). */
++#define NVVFX_PEER_FLUSH_AFTER_MS 150.0
++
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++struct nvvfx_xfer {
++    nvvfx_pipeline *p;
++    nvvfx_runtime *rt;
++    int slots;
++    int in_w, in_h, out_w, out_h;
++    ID3D11Texture2D *in[NVVFX_XFER_MAX_SLOTS], *out[NVVFX_XFER_MAX_SLOTS];
++    HANDLE in_share[NVVFX_XFER_MAX_SLOTS], out_share[NVVFX_XFER_MAX_SLOTS];
++    ID3D11Query *q[NVVFX_XFER_MAX_SLOTS];
++    int keyed;                     /* NVVFX_XFER_KEYED_MUTEX */
++    int no_flush;                  /* NVVFX_XFER_NO_FLUSH */
++    IDXGIKeyedMutex *in_km[NVVFX_XFER_MAX_SLOTS], *out_km[NVVFX_XFER_MAX_SLOTS];
++    int held[NVVFX_XFER_MAX_SLOTS];/* the run side holds both keys of the slot */
++    HANDLE timer;                  /* the run side's naps */
++    volatile LONG peers;
++    CRITICAL_SECTION stats_lock;
++    struct ring wall[NVVFX_XFER_STAT_COUNT];
++};
++
++struct nvvfx_peer {
++    nvvfx_xfer *x;
++    ID3D11Device *dev;
++    ID3D11DeviceContext *ctx;
++    ID3D11Texture2D *in[NVVFX_XFER_MAX_SLOTS], *out[NVVFX_XFER_MAX_SLOTS];
++    ID3D11Query *q[NVVFX_XFER_MAX_SLOTS];
++    IDXGIKeyedMutex *in_km[NVVFX_XFER_MAX_SLOTS], *out_km[NVVFX_XFER_MAX_SLOTS];
++    double put_ms[3];              /* the last put: copy, query end, flush (CPU) */
++};
++
++static int make_shared(nvvfx_xfer *x, int w, int h, UINT bind, ID3D11Texture2D **tex, HANDLE *share,
++                       IDXGIKeyedMutex **km, int level)
++{
++    D3D11_TEXTURE2D_DESC d = {
++        .Width = (UINT)w,
++        .Height = (UINT)h,
++        .MipLevels = 1,
++        .ArraySize = 1,
++        .Format = DXGI_FORMAT_R10G10B10A2_UNORM,
++        .SampleDesc = {1, 0},
++        .Usage = D3D11_USAGE_DEFAULT,
++        .BindFlags = bind,
++        .MiscFlags = x->keyed ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX : D3D11_RESOURCE_MISC_SHARED,
++    };
++    IDXGIResource *res = NULL;
++    HRESULT hr = ID3D11Device_CreateTexture2D(x->p->dev, &d, NULL, tex);
++    if (SUCCEEDED(hr))
++        hr = ID3D11Texture2D_QueryInterface(*tex, &nv_iid_dxgi_resource, (void **)&res);
++    if (SUCCEEDED(hr))
++        hr = IDXGIResource_GetSharedHandle(res, share);
++    if (SUCCEEDED(hr) && x->keyed)
++        hr = ID3D11Texture2D_QueryInterface(*tex, &nv_iid_keyed_mutex, (void **)km);
++    if (res)
++        IDXGIResource_Release(res);
++    if (FAILED(hr)) {
++        if (*km)
++            IDXGIKeyedMutex_Release(*km);
++        *km = NULL;
++        if (*tex)
++            ID3D11Texture2D_Release(*tex);
++        *tex = NULL;
++        return fail_at(&x->rt->lg, level, NVVFX_E_D3D, 0, 1, "shared R10G10B10A2_UNORM %dx%d texture "
++                       "(bind 0x%x): HRESULT 0x%08lx", w, h, (unsigned)bind, (unsigned long)hr);
++    }
++    return NVVFX_OK;
++}
++
++nvvfx_xfer *nvvfx_xfer_create(nvvfx_pipeline *p, int slots)
++{
++    return nvvfx_xfer_create_ex(p, slots, NVVFX_XFER_DEFAULT);
++}
++
++nvvfx_xfer *nvvfx_xfer_create_ex(nvvfx_pipeline *p, int slots, int flags)
++{
++    nvvfx_xfer *x;
++    UINT out_bind = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++    int s;
++    if (!p)
++        return NULL;
++    if (slots < 1 || slots > NVVFX_XFER_MAX_SLOTS) {
++        fail(&p->rt->lg, NVVFX_E_ARG, "nvvfx_xfer_create: %d slots (want 1..%d)", slots,
++             NVVFX_XFER_MAX_SLOTS);
++        return NULL;
++    }
++    x = calloc(1, sizeof(*x));
++    if (!x) {
++        fail(&p->rt->lg, NVVFX_E_NOMEM, "out of memory");
++        return NULL;
++    }
++    x->p = p;
++    x->rt = p->rt;
++    x->slots = slots;
++    x->keyed = !!(flags & NVVFX_XFER_KEYED_MUTEX);
++    x->no_flush = !!(flags & NVVFX_XFER_NO_FLUSH);
++    x->in_w = p->info.in_w;
++    x->in_h = p->info.in_h;
++    x->out_w = p->info.out_w;
++    x->out_h = p->info.out_h;
++    InitializeCriticalSection(&x->stats_lock);
++    for (s = 0; s < slots; s++) {
++        D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
++        HRESULT hr;
++        if (make_shared(x, x->in_w, x->in_h, D3D11_BIND_SHADER_RESOURCE, &x->in[s], &x->in_share[s],
++                        &x->in_km[s], NVVFX_LOG_ERROR))
++            goto fail;
++        if (make_shared(x, x->out_w, x->out_h, out_bind, &x->out[s], &x->out_share[s], &x->out_km[s],
++                        (out_bind & D3D11_BIND_UNORDERED_ACCESS) ? NVVFX_LOG_DEBUG : NVVFX_LOG_ERROR)) {
++            if (!(out_bind & D3D11_BIND_UNORDERED_ACCESS))
++                goto fail;
++            /* No shared UAV here: the pipeline then unpacks into a texture of
++             * its own and copies (nvvfx_pipeline_run handles an `out` without
++             * UNORDERED_ACCESS). */
++            out_bind = D3D11_BIND_SHADER_RESOURCE;
++            logm(&x->rt->lg, NVVFX_LOG_INFO, "xfer: the driver refuses a shared UAV texture; "
++                 "unpacking through a private one");
++            if (make_shared(x, x->out_w, x->out_h, out_bind, &x->out[s], &x->out_share[s],
++                            &x->out_km[s], NVVFX_LOG_ERROR))
++                goto fail;
++        }
++        hr = ID3D11Device_CreateQuery(p->dev, &qd, &x->q[s]);
++        if (FAILED(hr)) {
++            d3d_fail(&x->rt->lg, hr, "xfer: CreateQuery(EVENT)");
++            goto fail;
++        }
++    }
++    x->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                      TIMER_ALL_ACCESS);
++    if (!x->timer)
++        x->timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
++    logm(&x->rt->lg, NVVFX_LOG_DEBUG, "xfer: %d slot(s) of shared %dx%d -> %dx%d R10G10B10A2_UNORM, "
++         "output %s", slots, x->in_w, x->in_h, x->out_w, x->out_h,
++         (out_bind & D3D11_BIND_UNORDERED_ACCESS) ? "written directly (shared UAV)" : "copied in");
++    return x;
++
++fail:
++    nvvfx_xfer_destroy(x);
++    return NULL;
++}
++
++void nvvfx_xfer_destroy(nvvfx_xfer *x)
++{
++    int s;
++    if (!x)
++        return;
++    if (InterlockedCompareExchange(&x->peers, 0, 0)) {
++        logm(&x->rt->lg, NVVFX_LOG_ERROR, "nvvfx_xfer_destroy with %ld peer(s) open; leaking it",
++             (long)InterlockedCompareExchange(&x->peers, 0, 0));
++        return;
++    }
++    /* (Legacy shared handles are not kernel handles: nothing to close.) */
++    for (s = 0; s < NVVFX_XFER_MAX_SLOTS; s++) {
++        if (x->in_km[s])
++            IDXGIKeyedMutex_Release(x->in_km[s]);
++        if (x->out_km[s])
++            IDXGIKeyedMutex_Release(x->out_km[s]);
++        if (x->in[s])
++            ID3D11Texture2D_Release(x->in[s]);
++        if (x->out[s])
++            ID3D11Texture2D_Release(x->out[s]);
++        if (x->q[s])
++            ID3D11Query_Release(x->q[s]);
++    }
++    if (x->timer)
++        CloseHandle(x->timer);
++    DeleteCriticalSection(&x->stats_lock);
++    free(x);
++}
++
++int nvvfx_xfer_slots(const nvvfx_xfer *x)
++{
++    return x ? x->slots : 0;
++}
++
++nvvfx_pipeline *nvvfx_xfer_pipeline(const nvvfx_xfer *x)
++{
++    return x ? x->p : NULL;
++}
++
++ID3D11Texture2D *nvvfx_xfer_texture(const nvvfx_xfer *x, int slot, int out)
++{
++    if (!x || slot < 0 || slot >= x->slots)
++        return NULL;
++    return out ? x->out[slot] : x->in[slot];
++}
++
++nvvfx_peer *nvvfx_peer_open(nvvfx_xfer *x, ID3D11Device *peer)
++{
++    nvvfx_peer *pr;
++    int s;
++    if (!x || !peer)
++        return NULL;
++    pr = calloc(1, sizeof(*pr));
++    if (!pr) {
++        fail(&x->rt->lg, NVVFX_E_NOMEM, "out of memory");
++        return NULL;
++    }
++    pr->x = x;
++    pr->dev = peer;
++    ID3D11Device_AddRef(peer);
++    ID3D11Device_GetImmediateContext(peer, &pr->ctx);
++    InterlockedIncrement(&x->peers);
++    for (s = 0; s < x->slots; s++) {
++        D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
++        HRESULT hr = ID3D11Device_OpenSharedResource(peer, x->in_share[s], &nv_iid_texture2d,
++                                                     (void **)&pr->in[s]);
++        if (SUCCEEDED(hr))
++            hr = ID3D11Device_OpenSharedResource(peer, x->out_share[s], &nv_iid_texture2d,
++                                                 (void **)&pr->out[s]);
++        if (SUCCEEDED(hr) && x->keyed)
++            hr = ID3D11Texture2D_QueryInterface(pr->in[s], &nv_iid_keyed_mutex, (void **)&pr->in_km[s]);
++        if (SUCCEEDED(hr) && x->keyed)
++            hr = ID3D11Texture2D_QueryInterface(pr->out[s], &nv_iid_keyed_mutex, (void **)&pr->out_km[s]);
++        if (FAILED(hr)) {
++            d3d_fail(&x->rt->lg, hr, "peer: OpenSharedResource");
++            nvvfx_peer_close(pr);
++            return NULL;
++        }
++        hr = ID3D11Device_CreateQuery(peer, &qd, &pr->q[s]);
++        if (FAILED(hr)) {
++            d3d_fail(&x->rt->lg, hr, "peer: CreateQuery(EVENT)");
++            nvvfx_peer_close(pr);
++            return NULL;
++        }
++    }
++    return pr;
++}
++
++void nvvfx_peer_close(nvvfx_peer *pr)
++{
++    int s;
++    if (!pr)
++        return;
++    for (s = 0; s < NVVFX_XFER_MAX_SLOTS; s++) {
++        if (pr->in_km[s])
++            IDXGIKeyedMutex_Release(pr->in_km[s]);
++        if (pr->out_km[s])
++            IDXGIKeyedMutex_Release(pr->out_km[s]);
++        if (pr->in[s])
++            ID3D11Texture2D_Release(pr->in[s]);
++        if (pr->out[s])
++            ID3D11Texture2D_Release(pr->out[s]);
++        if (pr->q[s])
++            ID3D11Query_Release(pr->q[s]);
++    }
++    if (pr->ctx)
++        ID3D11DeviceContext_Release(pr->ctx);
++    if (pr->dev)
++        ID3D11Device_Release(pr->dev);
++    InterlockedDecrement(&pr->x->peers);
++    free(pr);
++}
++
++/* A peer-side texture argument: R10G10B10A2, single-sample, on the peer
++ * device, subresource `sub` at least w x h. */
++static int check_peer_tex(nvvfx_peer *pr, ID3D11Texture2D *t, UINT sub, int w, int h, const char *what)
++{
++    const struct nv_log *lg = &pr->x->rt->lg;
++    D3D11_TEXTURE2D_DESC d;
++    ID3D11Device *td = NULL;
++    UINT mip;
++    int same;
++    if (!t)
++        return fail(lg, NVVFX_E_ARG, "peer %s: NULL texture", what);
++    ID3D11Texture2D_GetDesc(t, &d);
++    if (!is_rgb10(d.Format) || d.SampleDesc.Count != 1 || !d.MipLevels ||
++        sub >= d.MipLevels * d.ArraySize)
++        return fail(lg, NVVFX_E_ARG, "peer %s: DXGI format %d, %u samples, subresource %u of %u",
++                    what, (int)d.Format, d.SampleDesc.Count, sub, d.MipLevels * d.ArraySize);
++    mip = sub % d.MipLevels;
++    if ((int)(d.Width >> mip) < w || (int)(d.Height >> mip) < h)
++        return fail(lg, NVVFX_E_ARG, "peer %s: subresource %u is %ux%u, smaller than %dx%d", what, sub,
++                    d.Width >> mip, d.Height >> mip, w, h);
++    ID3D11Texture2D_GetDevice(t, &td);
++    same = td == pr->dev;
++    if (td)
++        ID3D11Device_Release(td);
++    if (!same)
++        return fail(lg, NVVFX_E_ARG, "peer %s: the texture is not on the peer device", what);
++    return NVVFX_OK;
++}
++
++int nvvfx_peer_put(nvvfx_peer *pr, int slot, ID3D11Texture2D *src, UINT sub)
++{
++    nvvfx_xfer *x;
++    D3D11_BOX box;
++    int r;
++    if (!pr || slot < 0 || slot >= pr->x->slots)
++        return NVVFX_E_ARG;
++    x = pr->x;
++    r = check_peer_tex(pr, src, sub, x->in_w, x->in_h, "put");
++    if (r)
++        return r;
++    box.left = 0;
++    box.top = 0;
++    box.front = 0;
++    box.right = (UINT)x->in_w;
++    box.bottom = (UINT)x->in_h;
++    box.back = 1;
++    {
++        double t0 = now_ms(), t1, t2;
++        if (pr->in_km[slot]) {
++            /* By the slot rules the run side does not hold it, so this never
++             * waits (see xfer_acquire). */
++            HRESULT hr = IDXGIKeyedMutex_AcquireSync(pr->in_km[slot], 0, 0);
++            if (hr != S_OK)
++                return fail(&x->rt->lg, hr == DXGI_ERROR_DEVICE_REMOVED ? NVVFX_E_PEER_LOST : NVVFX_E_ARG,
++                            "peer put: slot %d input not free (AcquireSync 0x%08lx)", slot, (unsigned long)hr);
++        }
++        ID3D11DeviceContext_CopySubresourceRegion(pr->ctx, (ID3D11Resource *)pr->in[slot], 0, 0, 0, 0,
++                                                  (ID3D11Resource *)src, sub, &box);
++        if (pr->in_km[slot])
++            IDXGIKeyedMutex_ReleaseSync(pr->in_km[slot], 0);
++        t1 = now_ms();
++        ID3D11DeviceContext_End(pr->ctx, (ID3D11Asynchronous *)pr->q[slot]);
++        t2 = now_ms();
++        if (!x->no_flush)
++            ID3D11DeviceContext_Flush(pr->ctx);
++        pr->put_ms[0] = t1 - t0;
++        pr->put_ms[1] = t2 - t1;
++        pr->put_ms[2] = now_ms() - t2;
++    }
++    return NVVFX_OK;
++}
++
++int nvvfx_peer_get(nvvfx_peer *pr, int slot, ID3D11Texture2D *dst, UINT sub)
++{
++    nvvfx_xfer *x;
++    D3D11_BOX box;
++    int r;
++    if (!pr || slot < 0 || slot >= pr->x->slots)
++        return NVVFX_E_ARG;
++    x = pr->x;
++    r = check_peer_tex(pr, dst, sub, x->out_w, x->out_h, "get");
++    if (r)
++        return r;
++    box.left = 0;
++    box.top = 0;
++    box.front = 0;
++    box.right = (UINT)x->out_w;
++    box.bottom = (UINT)x->out_h;
++    box.back = 1;
++    if (pr->out_km[slot]) {
++        /* The run side released it after the private device had finished, so
++         * this never waits (see xfer_acquire). */
++        HRESULT hr = IDXGIKeyedMutex_AcquireSync(pr->out_km[slot], 0, 0);
++        if (hr != S_OK)
++            return fail(&x->rt->lg, hr == DXGI_ERROR_DEVICE_REMOVED ? NVVFX_E_PEER_LOST : NVVFX_E_ARG,
++                        "peer get: slot %d output not ready (AcquireSync 0x%08lx)", slot, (unsigned long)hr);
++    }
++    ID3D11DeviceContext_CopySubresourceRegion(pr->ctx, (ID3D11Resource *)dst, sub, 0, 0, 0,
++                                              (ID3D11Resource *)pr->out[slot], 0, &box);
++    if (pr->out_km[slot])
++        IDXGIKeyedMutex_ReleaseSync(pr->out_km[slot], 0);
++    return NVVFX_OK;
++}
++
++/* ~0.25 ms on a high-resolution waitable timer (Windows 10 1803+), else a
++ * plain one, else Sleep(1). */
++static void xfer_nap(nvvfx_xfer *x)
++{
++    LARGE_INTEGER due;
++    due.QuadPart = -2500;   /* 100-ns units, relative */
++    if (x->timer && SetWaitableTimer(x->timer, &due, 0, NULL, NULL, FALSE)) {
++        WaitForSingleObject(x->timer, 100);
++        return;
++    }
++    Sleep(1);
++}
++
++/* CPU-wait for an event query, polling with GetData(DONOTFLUSH): the device
++ * lock is taken by the runtime for the length of each GetData and never held
++ * here. */
++/* flush_every_ms > 0: a read that may flush the context (GetData without
++ * DONOTFLUSH) is made once the query has not completed for that long, and
++ * again every that long, for a peer whose own submissions have stopped (a
++ * paused or idle VO). */
++static int query_wait(nvvfx_xfer *x, ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Query *q,
++                      int timeout_ms, int lost, const char *what, double flush_every_ms)
++{
++    double t0 = now_ms(), deadline = t0 + (timeout_ms > 0 ? timeout_ms : 0);
++    double next_flush = flush_every_ms > 0 ? t0 + flush_every_ms : deadline + 1;
++    int n = 0;
++    for (;;) {
++        BOOL done = FALSE;
++        UINT gflags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
++        HRESULT hr;
++        if (now_ms() >= next_flush) {
++            gflags = 0;
++            next_flush = now_ms() + flush_every_ms;
++        }
++        hr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)q, &done, sizeof(done), gflags);
++        if (hr == S_OK)
++            return NVVFX_OK;
++        if (FAILED(hr)) {
++            HRESULT why = ID3D11Device_GetDeviceRemovedReason(dev);
++            return fail(&x->rt->lg, lost, "%s: GetData failed: HRESULT 0x%08lx (device removed "
++                        "reason 0x%08lx)", what, (unsigned long)hr, (unsigned long)why);
++        }
++        if (now_ms() >= deadline) {
++            HRESULT why = ID3D11Device_GetDeviceRemovedReason(dev);
++            if (why != S_OK)
++                return fail(&x->rt->lg, lost, "%s: the device was removed (HRESULT 0x%08lx)", what,
++                            (unsigned long)why);
++            return fail(&x->rt->lg, NVVFX_E_TIMEOUT, "%s: not finished after %d ms", what, timeout_ms);
++        }
++        if (n++ < 8)
++            SwitchToThread();
++        else
++            xfer_nap(x);
++    }
++}
++
++int nvvfx_xfer_wait_peer(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms)
++{
++    if (!x || !pr || pr->x != x || slot < 0 || slot >= x->slots)
++        return NVVFX_E_ARG;
++    return query_wait(x, pr->dev, pr->ctx, pr->q[slot], timeout_ms, NVVFX_E_PEER_LOST,
++                      "the video device's copy into the shared texture",
++                      x->no_flush ? NVVFX_PEER_FLUSH_AFTER_MS : 0.0);
++}
++
++/*
++ * Keyed mutexes (NVVFX_XFER_KEYED_MUTEX; not the default). They would not
++ * order anything: the event queries do, on the CPU. Every access, on either
++ * device, is AcquireSync(0) .. ReleaseSync(0), and by the slot rules the other
++ * device never holds the key then, so no acquire waits for the key, and the
++ * GPU wait an acquire implies is on work already seen finished; a single key
++ * also means a frame cancelled after its put, or a result never fetched,
++ * leaves nothing to undo. Kept for diagnosis only: on the peer, AcquireSync
++ * and ReleaseSync submit the peer's commands, and while the peer presents at
++ * vsync a submission from another thread blocks for up to two refreshes with
++ * the device lock held (nvvfx-harness "vo": get median 2.5 ms, worst 33 ms),
++ * which is what NVVFX_XFER_NO_FLUSH exists to avoid.
++ */
++static int xfer_acquire(nvvfx_xfer *x, int slot)
++{
++    HRESULT hr;
++    if (!x->keyed || x->held[slot])
++        return NVVFX_OK;
++    hr = IDXGIKeyedMutex_AcquireSync(x->in_km[slot], 0, 1000);
++    if (hr == S_OK) {
++        hr = IDXGIKeyedMutex_AcquireSync(x->out_km[slot], 0, 1000);
++        if (hr != S_OK)
++            IDXGIKeyedMutex_ReleaseSync(x->in_km[slot], 0);
++    }
++    if (hr != S_OK)
++        return fail(&x->rt->lg, hr == DXGI_ERROR_DEVICE_REMOVED ? NVVFX_E_LOST : NVVFX_E_TIMEOUT,
++                    "xfer: slot %d is held by the peer (AcquireSync 0x%08lx)", slot, (unsigned long)hr);
++    x->held[slot] = 1;
++    return NVVFX_OK;
++}
++
++static void xfer_release_keys(nvvfx_xfer *x, int slot)
++{
++    if (!x->keyed || !x->held[slot])
++        return;
++    IDXGIKeyedMutex_ReleaseSync(x->in_km[slot], 0);
++    IDXGIKeyedMutex_ReleaseSync(x->out_km[slot], 0);
++    x->held[slot] = 0;
++}
++
++int nvvfx_xfer_submit(nvvfx_xfer *x, int slot)
++{
++    nvvfx_pipeline *p;
++    int r;
++    if (!x || slot < 0 || slot >= x->slots)
++        return NVVFX_E_ARG;
++    p = x->p;
++    r = xfer_acquire(x, slot);
++    if (r)
++        return r;
++    r = nvvfx_pipeline_run(p, x->in[slot], x->out[slot]);
++    if (r) {
++        xfer_release_keys(x, slot);
++        HRESULT why = ID3D11Device_GetDeviceRemovedReason(p->dev);
++        if (why != S_OK) {
++            p->broken = 1;
++            return fail(&x->rt->lg, NVVFX_E_LOST, "the NVIDIA device was removed (HRESULT 0x%08lx)",
++                        (unsigned long)why);
++        }
++        return r;
++    }
++    ID3D11DeviceContext_End(p->ctx, (ID3D11Asynchronous *)x->q[slot]);
++    ID3D11DeviceContext_Flush(p->ctx);
++    return NVVFX_OK;
++}
++
++int nvvfx_xfer_wait_done(nvvfx_xfer *x, int slot, int timeout_ms)
++{
++    int r;
++    if (!x || slot < 0 || slot >= x->slots)
++        return NVVFX_E_ARG;
++    r = query_wait(x, x->p->dev, x->p->ctx, x->q[slot], timeout_ms, NVVFX_E_LOST,
++                   "the NVIDIA device's processing", 0.0);
++    /* Finished (or given up on): the keys go back only now, so the peer's
++     * GPU never waits on unfinished work of the private device. */
++    xfer_release_keys(x, slot);
++    return r;
++}
++
++void nvvfx_peer_put_times(const nvvfx_peer *pr, double ms[3])
++{
++    int i;
++    for (i = 0; i < 3; i++)
++        ms[i] = pr ? pr->put_ms[i] : 0;
++}
++
++void nvvfx_xfer_note_times(nvvfx_xfer *x, double wait_peer_ms, double submit_ms, double wait_done_ms)
++{
++    if (!x)
++        return;
++    EnterCriticalSection(&x->stats_lock);
++    ring_push(&x->wall[NVVFX_XFER_WAIT_PEER], wait_peer_ms);
++    ring_push(&x->wall[NVVFX_XFER_SUBMIT], submit_ms);
++    ring_push(&x->wall[NVVFX_XFER_WAIT_DONE], wait_done_ms);
++    ring_push(&x->wall[NVVFX_XFER_CYCLE], wait_peer_ms + submit_ms + wait_done_ms);
++    LeaveCriticalSection(&x->stats_lock);
++}
++
++double nvvfx_now_ms(void)
++{
++    return now_ms();
++}
++
++int nvvfx_xfer_run(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms)
++{
++    double t0 = now_ms(), t1, t2, t3;
++    int r = nvvfx_xfer_wait_peer(x, pr, slot, timeout_ms);
++    t1 = now_ms();
++    if (!r)
++        r = nvvfx_xfer_submit(x, slot);
++    t2 = now_ms();
++    if (!r)
++        r = nvvfx_xfer_wait_done(x, slot, timeout_ms);
++    t3 = now_ms();
++    if (!r)
++        nvvfx_xfer_note_times(x, t1 - t0, t2 - t1, t3 - t2);
++    return r;
++}
++
++void nvvfx_xfer_stats(const nvvfx_xfer *x, int which, nvvfx_stage_stats *out)
++{
++    if (!out)
++        return;
++    memset(out, 0, sizeof(*out));
++    if (!x || which < 0 || which >= NVVFX_XFER_STAT_COUNT)
++        return;
++    EnterCriticalSection((CRITICAL_SECTION *)&x->stats_lock);
++    ring_stats(&x->wall[which], &out->count, &out->median_ms, &out->p99_ms, &out->max_ms,
++               &out->last_ms);
++    LeaveCriticalSection((CRITICAL_SECTION *)&x->stats_lock);
++}
++
++void nvvfx_xfer_reset_stats(nvvfx_xfer *x)
++{
++    if (!x)
++        return;
++    EnterCriticalSection(&x->stats_lock);
++    memset(x->wall, 0, sizeof(x->wall));
++    LeaveCriticalSection(&x->stats_lock);
++}
 diff --git a/video/filter/nvvfx_core.h b/video/filter/nvvfx_core.h
 new file mode 100644
-index 0000000..4d01270
+index 0000000..309d01f
 --- /dev/null
 +++ b/video/filter/nvvfx_core.h
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,535 @@
 +/*
 + * nvvfx_core.h - the NVIDIA-facing core of vf_nvvfx: NVIDIA Video Effects SDK
 + * 1.3 "VideoSuperRes" on Direct3D 11 R10G10B10A2 frames, entirely on the GPU.
@@ -2950,6 +3721,13 @@ index 0000000..4d01270
 + *   second, refcounted pool that knows when the VO is done with a frame.
 + *
 + * Device and threading:
++ *   - A pipeline belongs on a device of its own: nvvfx_device_create() makes
++ *     one on the adapter of the device that decodes and presents, and frames
++ *     cross between the two through nvvfx_xfer (see "cross-device transfer"
++ *     below). Never create a pipeline on a device that presents: on such a
++ *     device CUDA's D3D11 interop calls were measured blocking for 1-3 s and
++ *     a frame's GPU span reaching 1.6 s (nvvfx-harness "vorepro"; in mpv the
++ *     same structure reset the driver within seconds).
 + *   - Any thread may call (the CUDA device is made current at the start of
 + *     every call), one call per pipeline at a time. Measured: a pipeline created
 + *     on a worker thread runs correctly from another thread, and the device
@@ -3011,6 +3789,9 @@ index 0000000..4d01270
 +#define NVVFX_E_UNSUPPORTED  -6  /* the runtime/device cannot do what was asked */
 +#define NVVFX_E_BROKEN       -7  /* an earlier failure left the pipeline unusable: recreate it */
 +#define NVVFX_E_RUNTIME      -8  /* runtime not found or incomplete */
++#define NVVFX_E_TIMEOUT      -9  /* a bounded wait for the GPU ran out */
++#define NVVFX_E_LOST        -10  /* the core's own (private) device was removed: the GPU was reset */
++#define NVVFX_E_PEER_LOST   -11  /* the peer device (the VO's) was removed */
 +
 +const char *nvvfx_strerror(int err);
 +
@@ -3240,7 +4021,10 @@ index 0000000..4d01270
 +int nvvfx_pipeline_set_levels(nvvfx_pipeline *p, int deblur_level, int upscale_level);
 +int nvvfx_pipeline_reload(nvvfx_pipeline *p);
 +
-+/* Per-stage timing over the last NVVFX_STATS_RING frames. Wall times are QPC;
++/* Per-stage timing over the last NVVFX_STATS_RING frames. The samples are
++ * reset whenever nvvfx_pipeline_set_levels() changes a level, so the medians
++ * describe the levels in force. Safe to read from another thread while a run
++ * is in progress (the rings are locked). Wall times are QPC;
 + * GPU times are CUDA events around the CUDA part of a stage (timing SYNC or
 + * EVENTS only); the GPU time of NVVFX_STAGE_TOTAL runs from the start of the
 + * CUDA part of transfer in to the end of the CUDA part of transfer out.
@@ -3258,6 +4042,143 @@ index 0000000..4d01270
 +
 +void nvvfx_pipeline_stats(const nvvfx_pipeline *p, int stage, nvvfx_stage_stats *out);
 +void nvvfx_pipeline_reset_stats(nvvfx_pipeline *p);
++
++/* ------------------------------------------------------------------ private device */
++
++/*
++ * A D3D11 device of the core's own, on the adapter with this LUID, created the
++ * way nvvfx-harness has always created its device (feature level 11_1 or 11_0,
++ * BGRA and video support flags) and multithread-protected. Nothing else ever
++ * lives on it: no swapchain, no decoder, no video processor. d3d11.dll and
++ * dxgi.dll are loaded at run time, so no import library is needed. Returns
++ * NULL after one log line.
++ */
++typedef struct nvvfx_device nvvfx_device;
++
++nvvfx_device *nvvfx_device_create(const LUID *luid, nvvfx_log_fn log, void *log_ctx);
++void nvvfx_device_destroy(nvvfx_device *d);
++ID3D11Device *nvvfx_device_d3d11(const nvvfx_device *d);   /* no reference is added */
++LUID nvvfx_device_luid(const nvvfx_device *d);
++const char *nvvfx_device_name(const nvvfx_device *d);
++/* S_OK while the device is usable, else what GetDeviceRemovedReason says. */
++HRESULT nvvfx_device_removed_reason(const nvvfx_device *d);
++
++/* The adapter LUID of any D3D11 device. NVVFX_OK or NVVFX_E_D3D. */
++int nvvfx_adapter_luid(ID3D11Device *dev, LUID *luid);
++
++/* ------------------------------------------------------------------ cross-device transfer */
++
++/*
++ * How frames reach a pipeline on a private device from the device that
++ * decodes and presents them (the "peer": mpv's VO device), and come back:
++ *
++ *   peer (any one thread):   frame -> in[slot] (CopySubresourceRegion),
++ *                            End(peer query[slot]), Flush        nvvfx_peer_put
++ *   run side (one thread):   CPU-wait for the peer query          nvvfx_xfer_wait_peer
++ *                            pipeline in[slot] -> out[slot],
++ *                            End(query[slot]), Flush              nvvfx_xfer_submit
++ *                            CPU-wait for that query              nvvfx_xfer_wait_done
++ *   peer:                    out[slot] -> frame (CopySubresourceRegion)   nvvfx_peer_get
++ *
++ * in[] and out[] are R10G10B10A2_UNORM textures created on the private device
++ * with D3D11_RESOURCE_MISC_SHARED (in: SHADER_RESOURCE; out: SHADER_RESOURCE |
++ * UNORDERED_ACCESS, or SHADER_RESOURCE alone if the driver refuses a shared
++ * UAV, at the cost of one more copy on the private device) and opened on the
++ * peer with OpenSharedResource. Measured on an RTX 4090 (nvvfx-harness
++ * "sharecaps"): R10G10B10A2_UNORM, R32_UINT and R8G8B8A8_UNORM all report
++ * FORMAT_SUPPORT2_SHAREABLE and share with SRV, RT and UAV in any combination;
++ * an open costs ~0.02 ms. Nothing registered with CUDA is ever shared.
++ *
++ * Synchronisation is a CPU wait, on the run side, for an event query on the
++ * device that produced the data: no device is ever made to wait on the GPU
++ * for the other one (no keyed mutex, no shared fence), so the peer's GPU
++ * queue can never stall behind SDK work. A put ends a query that covers every
++ * earlier command of the peer's immediate context, so the run that follows a
++ * put into a slot also waits for the previous get from that slot. The waits
++ * poll GetData(DONOTFLUSH) with ~0.25 ms high-resolution sleeps and give up
++ * after timeout_ms with NVVFX_E_TIMEOUT; a removed device is NVVFX_E_LOST
++ * (private) or NVVFX_E_PEER_LOST (peer).
++ *
++ * The peer is never flushed by default (NVVFX_XFER_NO_FLUSH): a put only
++ * records a copy and a query end, and the peer's own next submission (mpv's
++ * VO renders and presents every refresh) carries them to the GPU. Measured
++ * (nvvfx-harness "vo", --flush-probe): on a device presenting at vsync, a
++ * Flush from another thread - even of one 16x16 copy, with no SDK anywhere -
++ * blocks for 7 ms on average at 60 Hz and 15 ms at 20 Hz, worst 80-98 ms,
++ * holding the device's lock, so every other thread on the device waits too
++ * (0.19 ms without a presenter). The keyed-mutex calls submit as well and
++ * block the same way. The cost of not flushing is latency: a put completes
++ * when the peer has next submitted and its GPU has reached the copy, measured
++ * at a median 13 ms / worst 34 ms at 60 Hz and 18-22 ms / worst 95 ms at
++ * 20 Hz, so a caller should keep several frames in flight (vf_nvvfx keeps
++ * four: at 24 fps and a 20 Hz present rate two slots left half the results
++ * late, three left 4% late with the heaviest settings, four none). If a put
++ * has not completed after
++ * NVVFX_PEER_FLUSH_AFTER_MS (150 ms; a paused or idle peer), the run side
++ * flushes the peer itself (a GetData without DONOTFLUSH).
++ *
++ * Slot rules (the caller's to keep): put into a slot only when no run of it is
++ * in progress; get from it only after its run returned NVVFX_OK and before the
++ * next put into it. The peer functions never wait, and never call CUDA or the
++ * SDK. The run side never holds a device lock across a call.
++ */
++#define NVVFX_XFER_MAX_SLOTS 4
++
++typedef struct nvvfx_xfer nvvfx_xfer;
++typedef struct nvvfx_peer nvvfx_peer;
++
++/* For a pipeline (on whatever device it was created on). The xfer does not own
++ * the pipeline; destroy the xfer first. NULL after one log line. */
++nvvfx_xfer *nvvfx_xfer_create(nvvfx_pipeline *p, int slots);
++#define NVVFX_XFER_LEGACY_SHARED  0  /* D3D11_RESOURCE_MISC_SHARED textures */
++#define NVVFX_XFER_KEYED_MUTEX    1  /* D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX (diagnosis only) */
++#define NVVFX_XFER_NO_FLUSH       2  /* a put does not flush the peer: the peer's own next
++                                        submission carries it (see the transfer notes) */
++#define NVVFX_XFER_DEFAULT        (NVVFX_XFER_LEGACY_SHARED | NVVFX_XFER_NO_FLUSH)
++nvvfx_xfer *nvvfx_xfer_create_ex(nvvfx_pipeline *p, int slots, int flags);
++void nvvfx_xfer_destroy(nvvfx_xfer *x);
++int nvvfx_xfer_slots(const nvvfx_xfer *x);
++nvvfx_pipeline *nvvfx_xfer_pipeline(const nvvfx_xfer *x);
++/* The private textures of a slot (tests). */
++ID3D11Texture2D *nvvfx_xfer_texture(const nvvfx_xfer *x, int slot, int out);
++
++/* The xfer's textures opened on `peer`, plus one event query per slot there.
++ * Closing a peer releases only peer-side objects; the xfer stays usable for
++ * another peer. A peer must be closed before its xfer is destroyed. */
++nvvfx_peer *nvvfx_peer_open(nvvfx_xfer *x, ID3D11Device *peer);
++void nvvfx_peer_close(nvvfx_peer *pr);
++
++/* Peer side. put: copy the top-left in_w x in_h of `src` (subresource `sub`;
++ * R10G10B10A2, on the peer device) into in[slot] and End the slot's peer query
++ * (and Flush, without NVVFX_XFER_NO_FLUSH). get: copy out[slot] into the
++ * top-left out_w x out_h of `dst` (subresource `sub`). Neither waits.
++ * NVVFX_OK or NVVFX_E_ARG. */
++int nvvfx_peer_put(nvvfx_peer *pr, int slot, ID3D11Texture2D *src, UINT sub);
++int nvvfx_peer_get(nvvfx_peer *pr, int slot, ID3D11Texture2D *dst, UINT sub);
++/* The CPU time of the last put's three calls: copy, query end, flush (ms). */
++void nvvfx_peer_put_times(const nvvfx_peer *pr, double ms[3]);
++
++/* Run side, one thread at a time per xfer. */
++int nvvfx_xfer_wait_peer(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms);
++int nvvfx_xfer_submit(nvvfx_xfer *x, int slot);
++int nvvfx_xfer_wait_done(nvvfx_xfer *x, int slot, int timeout_ms);
++/* The three in order, timed into the xfer's stats. */
++int nvvfx_xfer_run(nvvfx_xfer *x, nvvfx_peer *pr, int slot, int timeout_ms);
++/* For a caller that makes the three calls itself: record one run's times. */
++void nvvfx_xfer_note_times(nvvfx_xfer *x, double wait_peer_ms, double submit_ms, double wait_done_ms);
++/* The core's clock (QueryPerformanceCounter, ms). */
++double nvvfx_now_ms(void);
++
++/* Wall times of nvvfx_xfer_run over the last NVVFX_STATS_RING runs (count,
++ * median_ms, p99_ms, max_ms, last_ms of nvvfx_stage_stats; no GPU times). */
++#define NVVFX_XFER_WAIT_PEER  0  /* waiting for the peer's put to complete */
++#define NVVFX_XFER_SUBMIT     1  /* the pipeline run call (CPU: queuing) */
++#define NVVFX_XFER_WAIT_DONE  2  /* from the end of the submit to the private device's completion */
++#define NVVFX_XFER_CYCLE      3  /* the whole nvvfx_xfer_run */
++#define NVVFX_XFER_STAT_COUNT 4
++
++void nvvfx_xfer_stats(const nvvfx_xfer *x, int which, nvvfx_stage_stats *out);
++void nvvfx_xfer_reset_stats(nvvfx_xfer *x);
 +
 +/* ------------------------------------------------------------------ repack */
 +
@@ -3602,10 +4523,10 @@ index 0000000..9939e9e
 +#endif
 diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
 new file mode 100644
-index 0000000..2f0a78f
+index 0000000..e0a62a4
 --- /dev/null
 +++ b/video/filter/vf_nvvfx.c
-@@ -0,0 +1,1871 @@
+@@ -0,0 +1,2533 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -3634,35 +4555,59 @@ index 0000000..2f0a78f
 + *
 + * Input:  IMGFMT_D3D11 with hw_subfmt x2bgr10 (DXGI_FORMAT_R10G10B10A2_UNORM)
 + *         on the VO's device. Anything else passes through untouched.
-+ * Output: IMGFMT_D3D11[x2bgr10] from this filter's own FFmpeg frames pool,
-+ *         possibly larger, with every attribute of the input frame.
++ * Output: IMGFMT_D3D11[x2bgr10] from this filter's own FFmpeg frames pool on
++ *         the VO's device, possibly larger, with every attribute of the input.
++ *
++ * Two devices. The SDK, CUDA and every texture registered with CUDA live on a
++ * private D3D11 device the core creates on the VO's adapter (found by LUID),
++ * once per process, on a worker thread; the VO's device (which decodes,
++ * converts and presents) only ever records plain copies into and out of
++ * shared R10G10B10A2 textures and an event query, never a flush: the VO's own
++ * next submission carries them. (With CUDA's D3D11 interop on the VO's
++ * device, mpv reset the GPU driver within seconds.) Neither device ever waits
++ * on the GPU for the other: every handover is a CPU wait on a runner thread
++ * for an event query on the device that produced the data (see "cross-device
++ * transfer" in nvvfx_core.h).
++ *
++ * Asynchronous. Per frame: the playloop copies the frame into a free slot
++ * (nvvfx_peer_put) and queues it; this filter's runner thread waits for that
++ * copy, runs the pipeline on the private device, waits for it to finish and
++ * wakes the filter; the playloop then copies the result into a frame of its
++ * own pool (nvvfx_peer_get) and sends it on. Up to NVVFX_SLOTS frames are in
++ * flight, and every frame leaves in the order it came, passthrough frames
++ * included. A processed frame leaves when its copy in has reached the GPU
++ * with the VO's next submission, the pipeline has run, and the next filter
++ * asks for it: measured 20-30 ms at 60 Hz, up to ~100 ms at a 20 Hz present
++ * rate. The playloop never waits for the GPU: it only ever looks at whether
++ * the oldest frame is done.
 + *
 + * Rules this filter keeps:
 + *  - It never fails: creation always succeeds, and every problem (no runtime,
-+ *    no device, an effect that will not load, an error mid-film) is logged once
-+ *    and turns the filter into a passthrough. One frame in, one frame out, in
-+ *    order; nothing is buffered.
++ *    no device, an effect that will not load, an error or a timeout
++ *    mid-film, a lost device) is logged once and turns the filter into a
++ *    passthrough, frames still in flight leaving unprocessed and in order.
 + *  - Nothing slow runs on the playloop thread (it also feeds the audio
-+ *    output): the runtime is loaded and pipelines are created on a worker
-+ *    thread. Until a pipeline is ready the filter keeps doing what it was
-+ *    doing: running the pipeline it has (if the frame fits it), else passing
-+ *    frames through. Destroying the filter never waits for the worker
-+ *    either: a worker caught inside a creation finishes it on its own, gives
-+ *    the pipeline to the cache and exits; mp_destroy() drains such workers
-+ *    (vf_nvvfx_drain) so none is cut off when the process exits.
++ *    output): the runtime is loaded, the private device is made and pipelines
++ *    are created on a worker thread; frames run on the runner thread. Until a
++ *    pipeline is ready the filter keeps running the one it has (if the frame
++ *    fits it), else passes frames through. Destroying the filter never waits
++ *    for either thread: each finishes what it is doing on its own, gives back
++ *    what it holds and exits; mp_destroy() drains them (vf_nvvfx_drain).
 + *  - Pipelines are never destroyed. NVIDIA's 1.3 SDK does not give back the
 + *    GPU memory of an effect instance destroyed while any other exists, so
 + *    every pipeline goes into a process-wide cache when its filter is done
 + *    with it, and the next filter that needs the same kind borrows it (a
-+ *    toggle off/on, or the next film of the same size, loads nothing).
-+ *    Levels and strengths are changed live on whichever pipeline is borrowed.
++ *    toggle off/on, or the next film of the same size, loads nothing). The
++ *    cache is keyed by the private device, not the VO's, so it survives the
++ *    VO's device being recreated. Levels and strengths are changed live.
 + *  - Every new model costs GPU memory for the rest of the process, so a new
 + *    pipeline, or a level a pipeline has never run, is only loaded while the
 + *    adapter has headroom left (NVVFX_MEM_RESERVE_MB*); otherwise the filter
 + *    keeps what it has and says why in its metadata.
-+ *  - Locks: pipeline creations (and the runtime load) are serialised
-+ *    process-wide by nv_create_lock, runs and live changes by nv_run_lock; a
-+ *    run may overlap a creation (measured safe). No device lock is ever held
++ *  - Locks: creations (and the runtime load and the private device) are
++ *    serialised process-wide by nv_create_lock, runs and live changes by
++ *    nv_run_lock (held around the submit only, never across a wait); a run
++ *    may overlap a creation (measured safe). No device lock is ever held
 + *    across a call into the core.
 + */
 +
@@ -3710,11 +4655,40 @@ index 0000000..2f0a78f
 +#define NVVFX_MEM_RESERVE_MB     3072
 +#define NVVFX_MEM_RESERVE_MB_8K  5120
 +
++// Frames in flight (each a pair of shared textures in the pipeline's cache
++// entry: ~66 MB at 4K, ~166 MB at 4K -> 8K). The VO device is never flushed
++// from here (a flush on a device that presents blocks, with its lock held,
++// for up to several refreshes), so a copy into or out of a slot reaches the
++// GPU with the VO's own next submission. Measured in nvvfx-harness "vo" at
++// 24 fps: at a 20 Hz present rate (slower than a 23.976 Hz display) two slots
++// left half the results late, three left 4% late by up to 13 ms with
++// Deblur Ultra + HighBitrate Ultra 4K -> 8K, four left none; at 60 Hz three
++// left none.
++#define NVVFX_SLOTS 4
++// Frames held in order: the ones in flight plus passthrough frames behind them.
++#define NVVFX_QUEUE (NVVFX_SLOTS + 2)
++// The longest the runner waits for the VO device's copy into a slot (its
++// queue can be held up by what the VO does, a display mode change say), and
++// for the private device to finish a frame (5-35 ms normally).
++#define NVVFX_PEER_TIMEOUT_MS 5000
++#define NVVFX_RUN_TIMEOUT_MS 2000
++// A frame this long with the runner is given up on, from outside the runner
++// (which may be stuck inside the driver, where nothing can interrupt it).
++#define NVVFX_STALL_MS 10000
++// How often the worker looks for a stalled frame.
++#define NVVFX_WATCH_MS 250
++
 +#define NVVFX_PTS_RING 64
++#define NVVFX_LAT_RING 64
 +#define NVVFX_DEFAULT_STATS 240
++
++// A job the runner did not run (cancelled, or the filter gone). Not an error.
++#define JOB_SKIPPED 1
 +
 +static const char *const mem_full_detail =
 +    "GPU memory is full of models loaded earlier; restart the app to free it";
++static const char *const lost_detail =
++    "the GPU was reset; the AI filter is off until the app restarts";
 +
 +// Declared here so nothing depends on which GUIDs the headers define.
 +static const GUID nvvfx_iid_dxgi_device =
@@ -3726,16 +4700,29 @@ index 0000000..2f0a78f
 +// Process-wide state
 +// ===========================================================================
 +
-+// Serialises pipeline creation and the runtime load (worker threads only).
++// Serialises pipeline creation, the runtime load and the private devices'
++// creation (worker threads only).
 +static mp_static_mutex nv_create_lock = MP_STATIC_MUTEX_INITIALIZER;
 +static nvvfx_runtime *nv_rt;            // loaded once, never unloaded
 +
-+// Serialises runs and live changes (playloop threads; only ever contended
-+// with more than one player in the process).
++// The private devices, one per adapter: created by workers (nv_create_lock
++// held), looked up by anyone (nv_dev_lock only, which is held briefly).
++// Never destroyed: the cached pipelines live on them.
++#define NVVFX_MAX_PDEV 4
++static mp_static_mutex nv_dev_lock = MP_STATIC_MUTEX_INITIALIZER;
++static nvvfx_device *nv_pdev[NVVFX_MAX_PDEV];
++static int nv_num_pdev;
++
++// Serialises runs and live changes (runner threads; only ever contended with
++// more than one player in the process). Never held across a wait.
 +static mp_static_mutex nv_run_lock = MP_STATIC_MUTEX_INITIALIZER;
 +
-+// Worker threads whose filter is gone but which are still finishing what they
-+// were doing (at most one creation each). See vf_nvvfx_drain().
++// Set when a private device was removed (a GPU reset): CUDA does not survive
++// one, so nothing touches the SDK again in this process.
++static atomic_bool nv_lost;
++
++// Threads whose filter is gone but which are still finishing what they were
++// doing (a creation, or a frame). See vf_nvvfx_drain().
 +static mp_static_mutex nv_orphan_lock = MP_STATIC_MUTEX_INITIALIZER;
 +static mp_cond nv_orphan_cond = MP_STATIC_COND_INITIALIZER;
 +static int nv_orphans;                  // protected by nv_orphan_lock
@@ -3745,7 +4732,7 @@ index 0000000..2f0a78f
 +    struct cached *next;
 +
 +    // The key: what cannot change on a live pipeline.
-+    ID3D11Device *dev;                  // a reference is held
++    nvvfx_device *pdev;                 // the private device it lives on
 +    int in_w, in_h;
 +    bool deblur;                        // a deblur stage was asked for
 +    int up_family;                      // NVVFX_UPSCALE_*
@@ -3755,10 +4742,14 @@ index 0000000..2f0a78f
 +    bool in_use;                        // lent to a filter
 +    bool dead;                          // failed: never lent again
 +
-+    // --- owned by the borrower; handed over through nv_cache_lock
++    // --- set at creation, then read-only
 +    nvvfx_pipeline *pl;
++    nvvfx_xfer *xfer;                   // NVVFX_SLOTS slots of shared textures
 +    bool deblur_live, up_live;          // what the SDK accepted
 +    int out_w, out_h;
++
++    // --- owned by the borrower's runner thread (read by the borrower's
++    // playloop only when it borrows, before any frame of it runs)
 +    int deblur_level, up_level;         // in force
 +    float deblur_str, up_str;           // in force
 +    unsigned deblur_used, up_used;      // bit n: level n has run (its model is loaded)
@@ -3853,14 +4844,66 @@ index 0000000..2f0a78f
 +    RT_FAILED,
 +};
 +
-+// What a filter and its worker thread share. The filter never waits for the
-+// worker (a creation takes ~0.5 s, and the filter is destroyed on the
-+// playloop), so either may let go of this first; the last one frees it.
++// What a frame asks of the pipeline's live parameters (the options as they
++// were when it was queued).
++struct live {
++    int deblur;
++    float deblur_strength;
++    int upscale;
++    float upscale_strength;
++};
++
++enum job_state {
++    JOB_QUEUED = 1,             // waiting for the runner
++    JOB_RUNNING,                // the runner has it
++    JOB_DONE,                   // finished (or skipped, or given up on)
++};
++
++// One frame, in order. Lives in the link's ring from the moment the playloop
++// takes the frame until it sends it on.
++struct job {
++    uint64_t id;
++    bool process;               // false: a passthrough frame waiting for its turn
++
++    // --- set by the playloop before the job is queued, then read-only
++    int slot;
++    struct cached *entry;
++    nvvfx_peer *peer;
++    struct live live;
++    int64_t t_queued;
++    char detail[256];           // !process: why the frame passes through
++
++    // --- protected by link.lock
++    int state;
++    bool cancelled;             // its result is not wanted (reset, give-up)
++
++    // --- results, set by the runner (under link.lock) when it is done
++    int status;                 // NVVFX_OK, JOB_SKIPPED, or an NVVFX_E_* error
++    char error[512];
++    bool peer_side;             // the error was the VO device's
++    bool deb_held_mem, up_held_mem;
++
++    // --- the playloop's only
++    struct mp_image *img;       // the input frame; NULL once dropped (reset)
++};
++
++// A cache entry (and the peer the filter opened on it) to give back once the
++// runner is no longer running a frame of it.
++struct release {
++    struct cached *entry;
++    nvvfx_peer *peer;
++    bool kill;
++};
++
++// What a filter and its two threads (the worker, which loads and creates,
++// and the runner, which runs frames) share. The filter never waits for
++// either thread, so any of the three may let go of this first; the last one
++// frees it.
 +struct link {
 +    atomic_int refs;
 +
-+    // Set before the worker starts, then read-only. References are held.
-+    ID3D11Device *dev;
++    // Set before the threads start, then read-only. References are held.
++    LUID luid;                          // the VO device's adapter
 +    IDXGIAdapter3 *adapter3;            // for the memory guard; may be NULL
 +    char *path;                         // the path= option (malloc), or NULL
 +
@@ -3869,9 +4912,11 @@ index 0000000..2f0a78f
 +    struct mp_log *log;                 // protected by log_lock
 +
 +    mp_mutex lock;
-+    mp_cond cond;
++    mp_cond cond;                       // the worker's
++    mp_cond run_cond;                   // the runner's
 +    // --- protected by lock
 +    struct mp_filter *f;                // NULL once the filter is gone
++    // the worker's work
 +    bool prepare;                       // load the runtime
 +    bool job_pending;
 +    struct build job;
@@ -3881,24 +4926,39 @@ index 0000000..2f0a78f
 +    enum rt_state rt_state;
 +    char rt_error[512];
 +    char rt_detail[160];
++    // the frames
++    struct job jobs[NVVFX_QUEUE];       // a ring: head .. head + count - 1
++    int head, count;
++    uint64_t next_job_id;
++    bool busy;                          // the runner is running a frame
++    int64_t busy_since;
++    bool stalled, stall_reported;       // the worker saw a frame run too long
++    struct release releases[4];         // deferred until the runner is idle
++    int num_releases;
++
++    // --- the runner's only: the live parameters of the pipeline it runs
++    struct cached *run_entry;
++    int deb_held, up_held;              // a wanted level not applied (0: none)...
++    bool deb_held_mem, up_held_mem;     // ...because of the memory guard (else the SDK)
++    float deb_str_held, up_str_held;    // a strength the SDK refused (-1: none)
++    bool warned_mem, warned_refused;
 +};
 +
 +struct priv {
 +    struct opts *opts;
 +
 +    AVBufferRef *av_device_ref;
-+    ID3D11Device *dev;
-+    ID3D11DeviceContext *ctx;
++    ID3D11Device *dev;                  // the VO's
 +    ID3D10Multithread *mt;
 +    IDXGIAdapter3 *adapter3;            // for the memory guard; may be NULL
 +
 +    struct link *link;                  // always set
-+    mp_thread thread;
-+    bool thread_ok;
++    mp_thread worker, runner;
++    bool worker_ok, runner_ok;
 +
 +    // --- playloop thread only
 +    bool broken;                        // passthrough for the rest of this instance
-+    bool active;                        // the last frame went through a pipeline
++    bool active;                        // the last frame sent on went through a pipeline
 +    char detail[256];                   // why not, while !active
 +    bool rt_seen_failed;
 +    uint64_t next_id;
@@ -3907,21 +4967,26 @@ index 0000000..2f0a78f
 +
 +    struct cached *cur;                 // the pipeline in hand (borrowed)
 +    struct shape cur_shape;             // what it was borrowed for
++    nvvfx_peer *peer;                   // cur's shared textures opened on p->dev
++    bool slot_busy[NVVFX_SLOTS];
++    int inflight;                       // frames of cur queued or running
++
++    struct cached *ready;               // borrowed, waiting for the frames in flight to leave
++    struct shape ready_shape;
++    bool ready_created;
++    double ready_ms;
++    bool switch_wait;                   // a frame waits (unread) for that switch
++    bool want_release;                  // give cur back once nothing is in flight
 +
 +    bool mem_refused;                   // a build of refused_shape was refused...
 +    struct shape refused_shape;         // ...by the memory guard
-+    int deb_held, up_held;              // a wanted level not applied (0: none)...
-+    bool deb_held_mem, up_held_mem;     // ...because of the memory guard (else the SDK)
-+    float deb_str_held, up_str_held;    // a strength the SDK refused (-1: none)
-+    bool warned_mem, warned_refused;
++    bool held_mem;                      // the last frame ran with a level held back for memory
++    struct shape last_want;             // what the latest frame taken asked for
++    bool have_last_want;
++    bool warned_mem;
 +
-+    ID3D11Texture2D *in_copy;           // own single texture for array slices/padding
-+    int in_copy_w, in_copy_h;
-+    ID3D11Texture2D *out_tmp;           // exact-size output if pool frames are padded
-+    int out_tmp_w, out_tmp_h;
 +    AVBufferRef *out_pool;
 +    int pool_w, pool_h;
-+    UINT pool_bind, pool_misc;
 +
 +    int last_in_w, last_in_h, last_out_w, last_out_h;
 +    bool warned_input, warned_box;
@@ -3932,6 +4997,8 @@ index 0000000..2f0a78f
 +    double pts_delta[NVVFX_PTS_RING];
 +    int num_delta, pos_delta;
 +    bool warned_budget;
++    double latency[NVVFX_LAT_RING];     // ms from a frame's arrival to its result
++    int num_lat, pos_lat;
 +};
 +
 +static void set_passthrough(struct priv *p, const char *detail)
@@ -3954,6 +5021,8 @@ index 0000000..2f0a78f
 +    mp_mutex_init(&l->log_lock);
 +    mp_mutex_init(&l->lock);
 +    mp_cond_init(&l->cond);
++    mp_cond_init(&l->run_cond);
++    l->deb_str_held = l->up_str_held = -1.0f;
 +    return l;
 +}
 +
@@ -3962,12 +5031,20 @@ index 0000000..2f0a78f
 +    if (!l || atomic_fetch_sub(&l->refs, 1) != 1)
 +        return;
 +    SAFE_RELEASE(l->adapter3);
-+    SAFE_RELEASE(l->dev);
 +    free(l->path);
++    mp_cond_destroy(&l->run_cond);
 +    mp_cond_destroy(&l->cond);
 +    mp_mutex_destroy(&l->lock);
 +    mp_mutex_destroy(&l->log_lock);
 +    free(l);
++}
++
++static void orphan_done(void)
++{
++    mp_mutex_lock(&nv_orphan_lock);
++    nv_orphans--;
++    mp_cond_broadcast(&nv_orphan_cond);
++    mp_mutex_unlock(&nv_orphan_lock);
 +}
 +
 +// ===========================================================================
@@ -4049,24 +5126,73 @@ index 0000000..2f0a78f
 +}
 +
 +// ===========================================================================
++// Private devices
++// ===========================================================================
++
++static bool luid_equal(LUID a, LUID b)
++{
++    return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
++}
++
++// The private device on this adapter, or NULL if none has been made yet.
++static nvvfx_device *find_pdev(LUID luid)
++{
++    nvvfx_device *found = NULL;
++    mp_mutex_lock(&nv_dev_lock);
++    for (int n = 0; n < nv_num_pdev; n++) {
++        if (luid_equal(nvvfx_device_luid(nv_pdev[n]), luid)) {
++            found = nv_pdev[n];
++            break;
++        }
++    }
++    mp_mutex_unlock(&nv_dev_lock);
++    return found;
++}
++
++// Find or make the private device for the link's adapter. Worker only, with
++// nv_create_lock held (and the core attached for logging).
++static nvvfx_device *ensure_pdev(struct link *l, char *err, size_t err_size)
++{
++    nvvfx_device *d = find_pdev(l->luid);
++    if (d)
++        return d;
++    if (nv_num_pdev >= NVVFX_MAX_PDEV) {
++        snprintf(err, err_size, "too many adapters");
++        return NULL;
++    }
++    d = nvvfx_device_create(&l->luid, core_log, NULL);
++    if (!d) {
++        core_error(err, err_size, NVVFX_E_D3D);
++        return NULL;
++    }
++    mp_mutex_lock(&nv_dev_lock);
++    nv_pdev[nv_num_pdev++] = d;
++    mp_mutex_unlock(&nv_dev_lock);
++    link_log(l, MSGL_V, "Private D3D11 device made on %s.", nvvfx_device_name(d));
++    return d;
++}
++
++// ===========================================================================
 +// The pipeline cache
 +// ===========================================================================
 +
-+static bool entry_matches(const struct cached *e, ID3D11Device *dev,
++static bool entry_matches(const struct cached *e, nvvfx_device *pdev,
 +                          const struct shape *s)
 +{
-+    return e->dev == dev && e->in_w == s->in_w && e->in_h == s->in_h &&
++    return e->pdev == pdev && e->in_w == s->in_w && e->in_h == s->in_h &&
 +           e->deblur == (s->deblur > 0) && e->up_family == s->up_family &&
 +           e->fit_w == s->fit_w && e->fit_h == s->fit_h;
 +}
 +
 +// Lend a free pipeline of this kind, or NULL.
-+static struct cached *cache_borrow(ID3D11Device *dev, const struct shape *s)
++static struct cached *cache_borrow(nvvfx_device *pdev, const struct shape *s)
 +{
 +    struct cached *found = NULL;
++    if (!pdev)
++        return NULL;
 +    mp_mutex_lock(&nv_cache_lock);
 +    for (struct cached *e = nv_cache; e; e = e->next) {
-+        if (!e->in_use && !e->dead && entry_matches(e, dev, s)) {
++        if (!e->in_use && !e->dead && entry_matches(e, pdev, s)) {
 +            e->in_use = true;
 +            found = e;
 +            break;
@@ -4097,23 +5223,24 @@ index 0000000..2f0a78f
 +    mp_mutex_unlock(&nv_cache_lock);
 +}
 +
-+// Add a new pipeline, lent to the caller.
-+static struct cached *cache_add(ID3D11Device *dev, const struct build *job,
-+                                nvvfx_pipeline *pl)
++// Add a new pipeline, lent to the caller (or, without an xfer, dead).
++static struct cached *cache_add(nvvfx_device *pdev, const struct build *job,
++                                nvvfx_pipeline *pl, nvvfx_xfer *xfer)
 +{
 +    const nvvfx_pipeline_info *pi = nvvfx_pipeline_get_info(pl);
 +    struct cached *e = calloc(1, sizeof(*e));
 +    MP_HANDLE_OOM(e);
-+    e->dev = dev;
-+    ID3D11Device_AddRef(dev);
++    e->pdev = pdev;
 +    e->in_w = job->shape.in_w;
 +    e->in_h = job->shape.in_h;
 +    e->deblur = job->shape.deblur > 0;
 +    e->up_family = job->shape.up_family;
 +    e->fit_w = job->shape.fit_w;
 +    e->fit_h = job->shape.fit_h;
-+    e->in_use = true;
++    e->in_use = xfer != NULL;
++    e->dead = xfer == NULL;
 +    e->pl = pl;
++    e->xfer = xfer;
 +    e->deblur_live = pi->deblur_live;
 +    e->up_live = pi->upscale_live;
 +    e->out_w = pi->out_w;
@@ -4130,7 +5257,49 @@ index 0000000..2f0a78f
 +    e->next = nv_cache;
 +    nv_cache = e;
 +    mp_mutex_unlock(&nv_cache_lock);
-+    return e;
++    return e->dead ? NULL : e;
++}
++
++static void release_now(const struct release *r)
++{
++    nvvfx_peer_close(r->peer);
++    if (r->kill) {
++        cache_kill(r->entry);
++    } else {
++        cache_return(r->entry);
++    }
++}
++
++// Give back a pipeline and the peer opened on it, at once if the runner is
++// not running a frame (none of this filter's can be running a frame of
++// another pipeline), else as soon as it is done with that frame. Frames of
++// it still queued are cancelled. Playloop only.
++static void link_release(struct link *l, struct cached *e, nvvfx_peer *pr, bool kill)
++{
++    struct release r = {.entry = e, .peer = pr, .kill = kill};
++    bool now = true;
++    if (!e && !pr)
++        return;
++    mp_mutex_lock(&l->lock);
++    for (int n = 0; n < l->count; n++) {
++        struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++        if (j->process && j->state == JOB_QUEUED && j->entry == e) {
++            j->state = JOB_DONE;
++            j->cancelled = true;
++            j->status = JOB_SKIPPED;
++        }
++    }
++    if (l->busy && l->num_releases < (int)MP_ARRAY_SIZE(l->releases)) {
++        l->releases[l->num_releases++] = r;
++        now = false;
++    } else if (l->busy) {
++        // (Cannot happen: a filter holds one pipeline and one in reserve.)
++        // Leaking it is safe; giving it back under a running frame is not.
++        now = false;
++    }
++    mp_mutex_unlock(&l->lock);
++    if (now)
++        release_now(&r);
 +}
 +
 +// ===========================================================================
@@ -4166,17 +5335,7 @@ index 0000000..2f0a78f
 +    return *free_mb >= *need_mb;
 +}
 +
-+static void warn_mem(struct mp_filter *f, const char *what, double free_mb,
-+                     double need_mb)
-+{
-+    struct priv *p = f->priv;
-+    if (p->warned_mem)
-+        return;
-+    p->warned_mem = true;
-+    MP_WARN(f, "Not loading %s: %.0f MB of GPU memory left, %.0f MB wanted. "
-+            "The NVIDIA SDK keeps every model it loaded until the app exits; "
-+            "restart it to free them.\n", what, free_mb, need_mb);
-+}
++#define MEM_WARNING "Not loading %s: %.0f MB of GPU memory left, %.0f MB wanted. "     "The NVIDIA SDK keeps every model it loaded until the app exits; restart it to free them."
 +
 +// ===========================================================================
 +// Worker thread
@@ -4232,10 +5391,19 @@ index 0000000..2f0a78f
 +}
 +
 +// One build, with nv_create_lock held: from the cache if another filter has
-+// returned one meanwhile, else a new pipeline if the memory guard allows it.
++// returned one meanwhile, else a new pipeline (and its shared textures) on
++// the private device if the memory guard allows it.
 +static void do_build(struct link *l, const struct build *job, struct built *res)
 +{
-+    res->entry = cache_borrow(l->dev, &job->shape);
++    if (atomic_load(&nv_lost)) {
++        snprintf(res->error, sizeof(res->error), "%s", lost_detail);
++        return;
++    }
++    nvvfx_device *pdev = ensure_pdev(l, res->error, sizeof(res->error));
++    if (!pdev)
++        return;
++
++    res->entry = cache_borrow(pdev, &job->shape);
 +    if (res->entry)
 +        return;
 +
@@ -4249,14 +5417,20 @@ index 0000000..2f0a78f
 +    nvvfx_config cfg;
 +    config_of(job, &cfg);
 +    int64_t t0 = mp_time_ns();
-+    nvvfx_pipeline *pl = nvvfx_pipeline_create(nv_rt, l->dev, &cfg);
-+    res->ms = MP_TIME_NS_TO_MS(mp_time_ns() - t0);
++    nvvfx_pipeline *pl = nvvfx_pipeline_create(nv_rt, nvvfx_device_d3d11(pdev), &cfg);
 +    if (!pl) {
++        res->ms = MP_TIME_NS_TO_MS(mp_time_ns() - t0);
 +        core_error(res->error, sizeof(res->error), NVVFX_E_SDK);
 +        return;
 +    }
-+    res->entry = cache_add(l->dev, job, pl);
-+    res->created = true;
++    nvvfx_xfer *xfer = nvvfx_xfer_create(pl, NVVFX_SLOTS);
++    res->ms = MP_TIME_NS_TO_MS(mp_time_ns() - t0);
++    if (!xfer)
++        core_error(res->error, sizeof(res->error), NVVFX_E_D3D);
++    // Without its shared textures the pipeline is useless, but destroying it
++    // would not give its memory back: it goes into the cache dead.
++    res->entry = cache_add(pdev, job, pl, xfer);
++    res->created = res->entry != NULL;
 +}
 +
 +// Does the filter still wait for this build?
@@ -4268,10 +5442,24 @@ index 0000000..2f0a78f
 +    return wants;
 +}
 +
++// With l->lock held: tell the filter if the runner has been on one frame for
++// too long (it may be stuck inside the driver, where nothing can interrupt
++// it); the filter then stops waiting for it.
++static void watch_runner(struct link *l)
++{
++    if (l->f && l->busy && !l->stall_reported &&
++        mp_time_ns() - l->busy_since > MP_TIME_MS_TO_NS(NVVFX_STALL_MS))
++    {
++        l->stalled = true;
++        l->stall_reported = true;
++        mp_filter_wakeup(l->f);
++    }
++}
++
 +// The worker owns its request: it never touches the filter's private state,
 +// it outlives the filter if it must, and whatever it made that the filter no
 +// longer waits for (superseded, cancelled, or the filter gone) it gives to the
-+// cache itself.
++// cache itself. Between builds it watches the runner.
 +static MP_THREAD_VOID worker_main(void *arg)
 +{
 +    struct link *l = arg;
@@ -4280,9 +5468,10 @@ index 0000000..2f0a78f
 +
 +    mp_mutex_lock(&l->lock);
 +    while (l->f) {
++        watch_runner(l);
 +        bool can_build = l->job_pending && !l->result_ready;
 +        if (!l->prepare && !can_build) {
-+            mp_cond_wait(&l->cond, &l->lock);
++            mp_cond_timedwait(&l->cond, &l->lock, MP_TIME_MS_TO_NS(NVVFX_WATCH_MS));
 +            continue;
 +        }
 +        l->prepare = false;
@@ -4334,20 +5523,267 @@ index 0000000..2f0a78f
 +    mp_mutex_unlock(&l->lock);
 +
 +    link_unref(l);
++    orphan_done();
++    MP_THREAD_RETURN();
++}
 +
-+    mp_mutex_lock(&nv_orphan_lock);
-+    nv_orphans--;
-+    mp_cond_broadcast(&nv_orphan_cond);
-+    mp_mutex_unlock(&nv_orphan_lock);
++// ===========================================================================
++// Runner thread
++// ===========================================================================
 +
++// Bring the levels and strengths of the pipeline to what the frame asks for,
++// as far as allowed. Returns <0 on an error, else 1. Runner only, with
++// nv_run_lock held.
++static int apply_live(struct link *l, struct cached *e, const struct live *want)
++{
++    double free_mb, need_mb;
++
++    if (l->run_entry != e) {
++        l->run_entry = e;
++        l->deb_held = l->up_held = 0;
++        l->deb_held_mem = l->up_held_mem = false;
++        l->deb_str_held = l->up_str_held = -1.0f;
++    }
++
++    // Levels, for the stages the pipeline has and the options still want.
++    int dl = e->deblur_live && want->deblur > 0 ? want->deblur : 0;
++    int ul = e->up_live && upscale_family(want->upscale) == e->up_family ?
++             upscale_level(want->upscale) : 0;
++    if (!dl || dl == e->deblur_level) {
++        l->deb_held = 0;
++        dl = 0;
++    } else if (dl == l->deb_held) {
++        dl = 0;
++    } else if (!(e->deblur_used & (1u << dl)) &&
++               !headroom_ok(l->adapter3, e->out_w, e->out_h, &free_mb, &need_mb))
++    {
++        l->deb_held = dl;
++        l->deb_held_mem = true;
++        if (!l->warned_mem)
++            link_log(l, MSGL_WARN, MEM_WARNING, "another deblur level", free_mb, need_mb);
++        l->warned_mem = true;
++        dl = 0;
++    }
++    if (!ul || ul == e->up_level) {
++        l->up_held = 0;
++        ul = 0;
++    } else if (ul == l->up_held) {
++        ul = 0;
++    } else if (!(e->up_used & (1u << ul)) &&
++               !headroom_ok(l->adapter3, e->out_w, e->out_h, &free_mb, &need_mb))
++    {
++        l->up_held = ul;
++        l->up_held_mem = true;
++        if (!l->warned_mem)
++            link_log(l, MSGL_WARN, MEM_WARNING, "another upscale level", free_mb, need_mb);
++        l->warned_mem = true;
++        ul = 0;
++    }
++    if (dl || ul) {
++        int r = nvvfx_pipeline_set_levels(e->pl, dl ? dl : -1, ul ? ul : -1);
++        if (r < 0)
++            return r;
++        if (r == 0) {
++            // The SDK refused (logged by the core): keep the levels in force.
++            if (!l->warned_refused)
++                link_log(l, MSGL_WARN, "The level change was refused; keeping the current levels.");
++            l->warned_refused = true;
++            if (dl) {
++                l->deb_held = dl;
++                l->deb_held_mem = false;
++            }
++            if (ul) {
++                l->up_held = ul;
++                l->up_held_mem = false;
++            }
++        } else {
++            if (dl) {
++                e->deblur_level = dl;
++                e->deblur_used |= 1u << dl;
++            }
++            if (ul) {
++                e->up_level = ul;
++                e->up_used |= 1u << ul;
++            }
++            link_log(l, MSGL_V, "Levels changed live: deblur %s, upscale %s.",
++                     e->deblur_live ? m_opt_choice_str(deblur_names, e->deblur_level) : "off",
++                     e->up_live ? m_opt_choice_str(deblur_names, e->up_level) : "off");
++        }
++    }
++
++    // Strengths: free to change.
++    float ds = e->deblur_live && want->deblur > 0 ? want->deblur_strength : -1.0f;
++    float us = e->up_live && upscale_family(want->upscale) == e->up_family ?
++               want->upscale_strength : -1.0f;
++    if (ds == e->deblur_str || ds == l->deb_str_held)
++        ds = -1.0f;
++    if (us == e->up_str || us == l->up_str_held)
++        us = -1.0f;
++    if (ds >= 0 || us >= 0) {
++        int r = nvvfx_pipeline_set_strength(e->pl, ds, us);
++        if (r < 0)
++            return r;
++        if (r == 0) {
++            if (!l->warned_refused)
++                link_log(l, MSGL_WARN, "The strength change was refused; keeping the current strengths.");
++            l->warned_refused = true;
++            if (ds >= 0)
++                l->deb_str_held = ds;
++            if (us >= 0)
++                l->up_str_held = us;
++        } else {
++            if (ds >= 0)
++                e->deblur_str = ds;
++            if (us >= 0)
++                e->up_str = us;
++            link_log(l, MSGL_V, "Strengths changed live: deblur %.2f, upscale %.2f.",
++                     e->deblur_str, e->up_str);
++        }
++    }
++    return 1;
++}
++
++// One frame on the private device. Runner only, no lock held.
++static void run_job(struct link *l, const struct job *j, struct job *res)
++{
++    struct cached *e = j->entry;
++    nvvfx_xfer *x = e->xfer;
++    int r;
++
++    if (atomic_load(&nv_lost)) {
++        res->status = NVVFX_E_LOST;
++        snprintf(res->error, sizeof(res->error), "%s", lost_detail);
++        return;
++    }
++    nv_attach(l);
++    double t0 = nvvfx_now_ms();
++    // The VO device's copy into the slot (and every copy it made before,
++    // among them the last one out of this slot), waited for on this thread.
++    r = nvvfx_xfer_wait_peer(x, j->peer, j->slot, NVVFX_PEER_TIMEOUT_MS);
++    res->peer_side = r < 0;
++    double t1 = nvvfx_now_ms(), t2 = t1;
++    if (!r) {
++        mp_mutex_lock(&nv_run_lock);
++        r = apply_live(l, e, &j->live);
++        if (r >= 0)
++            r = nvvfx_xfer_submit(x, j->slot);
++        mp_mutex_unlock(&nv_run_lock);
++        t2 = nvvfx_now_ms();
++    }
++    if (!r)
++        r = nvvfx_xfer_wait_done(x, j->slot, NVVFX_RUN_TIMEOUT_MS);
++    if (!r)
++        nvvfx_xfer_note_times(x, t1 - t0, t2 - t1, nvvfx_now_ms() - t2);
++    if (r < 0) {
++        res->status = r;
++        core_error(res->error, sizeof(res->error), r);
++    } else {
++        res->status = NVVFX_OK;
++    }
++    res->deb_held_mem = l->deb_held && l->deb_held_mem;
++    res->up_held_mem = l->up_held && l->up_held_mem;
++    nv_detach();
++}
++
++static struct job *find_job(struct link *l, uint64_t id)
++{
++    for (int n = 0; n < l->count; n++) {
++        struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++        if (j->id == id)
++            return j;
++    }
++    return NULL;
++}
++
++// Runs the frames the playloop queues, oldest first, one at a time. Gives
++// back what the filter released while a frame was running once it is done,
++// and, after the filter is gone, everything the filter left with it.
++static MP_THREAD_VOID runner_main(void *arg)
++{
++    struct link *l = arg;
++
++    mp_thread_set_name("nvvfx-run");
++
++    mp_mutex_lock(&l->lock);
++    for (;;) {
++        struct release rel[MP_ARRAY_SIZE(l->releases)];
++        int num_rel = 0;
++        struct job *j = NULL;
++        for (int n = 0; n < l->count; n++) {
++            struct job *c = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++            if (c->state == JOB_QUEUED) {
++                j = c;
++                break;
++            }
++        }
++        if (!j) {
++            if (!l->f)
++                break;
++            mp_cond_wait(&l->run_cond, &l->lock);
++            continue;
++        }
++        if (j->cancelled || !l->f) {
++            j->state = JOB_DONE;
++            j->status = JOB_SKIPPED;
++            if (l->f)
++                mp_filter_wakeup(l->f);
++            continue;
++        }
++        j->state = JOB_RUNNING;
++        l->busy = true;
++        l->busy_since = mp_time_ns();
++        l->stall_reported = false;
++        struct job work = *j;           // (the inputs; read-only while queued)
++        mp_mutex_unlock(&l->lock);
++
++        struct job res = {0};
++        run_job(l, &work, &res);
++
++        mp_mutex_lock(&l->lock);
++        l->busy = false;
++        // Still wanted? (The playloop may have given up on it, or dropped it.)
++        j = find_job(l, work.id);
++        if (j && j->state == JOB_RUNNING) {
++            j->state = JOB_DONE;
++            j->status = res.status;
++            snprintf(j->error, sizeof(j->error), "%s", res.error);
++            j->peer_side = res.peer_side;
++            j->deb_held_mem = res.deb_held_mem;
++            j->up_held_mem = res.up_held_mem;
++        }
++        num_rel = l->num_releases;
++        memcpy(rel, l->releases, num_rel * sizeof(rel[0]));
++        l->num_releases = 0;
++        if (l->f)
++            mp_filter_wakeup(l->f);
++        mp_mutex_unlock(&l->lock);
++
++        for (int n = 0; n < num_rel; n++)
++            release_now(&rel[n]);
++
++        mp_mutex_lock(&l->lock);
++    }
++    // The filter is gone and nothing is left to run.
++    struct release rel[MP_ARRAY_SIZE(l->releases)];
++    int num_rel = l->num_releases;
++    memcpy(rel, l->releases, num_rel * sizeof(rel[0]));
++    l->num_releases = 0;
++    mp_mutex_unlock(&l->lock);
++    for (int n = 0; n < num_rel; n++)
++        release_now(&rel[n]);
++
++    link_unref(l);
++    orphan_done();
 +    MP_THREAD_RETURN();
 +}
 +
 +void vf_nvvfx_drain(void)
 +{
-+    // At most one creation per orphan (~0.5 s; ~1 s cold). The cap is for a
-+    // call into NVIDIA's DLLs that never returns.
-+    int64_t until = mp_time_ns_add(mp_time_ns(), 5.0);
++    // At most one creation (~0.5 s; ~1 s cold) or one frame (normally
++    // milliseconds; at most NVVFX_PEER_TIMEOUT_MS + NVVFX_RUN_TIMEOUT_MS) per
++    // orphan. The cap is for a call into NVIDIA's DLLs or the driver that
++    // never returns.
++    int64_t until = mp_time_ns_add(mp_time_ns(), 8.0);
 +    mp_mutex_lock(&nv_orphan_lock);
 +    while (nv_orphans > 0) {
 +        if (mp_cond_timedwait_until(&nv_orphan_cond, &nv_orphan_lock, until))
@@ -4460,17 +5896,31 @@ index 0000000..2f0a78f
 +    mp_mutex_unlock(&l->lock);
 +}
 +
-+static void release_current(struct priv *p)
++// Give back the pipeline waiting to be switched to.
++static void drop_ready(struct priv *p)
 +{
-+    cache_return(p->cur);
++    cache_return(p->ready);
++    p->ready = NULL;
++}
++
++// Give back the pipeline in hand (when no frame of it is in flight, at once).
++static void release_current(struct priv *p, bool kill)
++{
++    link_release(p->link, p->cur, p->peer, kill);
 +    p->cur = NULL;
++    p->peer = NULL;
++    p->want_release = false;
++    for (int n = 0; n < NVVFX_SLOTS; n++)
++        p->slot_busy[n] = false;
 +}
 +
 +// Turn into a passthrough for the rest of this instance, logging why once.
-+static void give_up(struct mp_filter *f, const char *detail, const char *fmt, ...)
-+    MP_PRINTF_ATTRIBUTE(3, 4);
++// Frames still queued leave unprocessed; a frame running is given up on.
++static void give_up(struct mp_filter *f, bool kill, const char *detail,
++                    const char *fmt, ...) MP_PRINTF_ATTRIBUTE(4, 5);
 +
-+static void give_up(struct mp_filter *f, const char *detail, const char *fmt, ...)
++static void give_up(struct mp_filter *f, bool kill, const char *detail,
++                    const char *fmt, ...)
 +{
 +    struct priv *p = f->priv;
 +    if (p->broken)
@@ -4483,8 +5933,10 @@ index 0000000..2f0a78f
 +    MP_ERR(f, "%s; passing frames through unprocessed.\n", line);
 +    p->broken = true;
 +    set_passthrough(p, detail);
-+    release_current(p);
 +    cancel_build(p);
++    drop_ready(p);
++    p->switch_wait = false;
++    release_current(p, kill);
 +}
 +
 +static const char *family_name(int family)
@@ -4506,42 +5958,60 @@ index 0000000..2f0a78f
 +    }
 +}
 +
-+// Start using a pipeline borrowed from the cache (or just created), giving
-+// back the one in hand.
-+static void take_pipeline(struct mp_filter *f, struct cached *e,
-+                          const struct shape *s, bool created, double ms)
++// Start using the pipeline waiting in p->ready, giving back the one in hand.
++// Only with no frame in flight.
++static void take_ready(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
++    struct cached *e = p->ready;
++    struct shape s = p->ready_shape;
++    bool created = p->ready_created;
++    double ms = p->ready_ms;
 +    const nvvfx_pipeline_info *pi = nvvfx_pipeline_get_info(e->pl);
++    p->ready = NULL;
 +
 +    if (!e->deblur_live && !e->up_live) {
 +        char detail[256];
 +        snprintf(detail, sizeof(detail), "no VideoSuperRes stage could be set up%s%s",
 +                 pi->fallback[0] ? ": " : "", pi->fallback);
 +        cache_return(e);
-+        give_up(f, detail, "%s", detail);
++        give_up(f, false, detail, "%s", detail);
 +        return;
 +    }
 +
-+    release_current(p);
++    release_current(p, false);
++
++    nv_attach(p->link);
++    nvvfx_peer *pr = nvvfx_peer_open(e->xfer, p->dev);
++    char err[512] = "";
++    if (!pr)
++        core_error(err, sizeof(err), NVVFX_E_D3D);
++    nv_detach();
++    if (!pr) {
++        cache_return(e);
++        give_up(f, false, err, "Opening the shared textures on the video device failed: %s", err);
++        return;
++    }
++
 +    p->cur = e;
-+    p->cur_shape = *s;
-+    p->deb_held = p->up_held = 0;
-+    p->deb_str_held = p->up_str_held = -1.0f;
++    p->cur_shape = s;
++    p->peer = pr;
 +    p->frames_since_report = 0;
 +    p->warned_budget = false;
++    p->num_lat = p->pos_lat = 0;
 +    nvvfx_pipeline_reset_stats(e->pl);
++    nvvfx_xfer_reset_stats(e->xfer);
 +
 +    char deb[48] = "off", up[64] = "off", how[48];
 +    if (e->deblur_live) {
 +        snprintf(deb, sizeof(deb), "%s", m_opt_choice_str(deblur_names, e->deblur_level));
-+    } else if (s->deblur > 0) {
++    } else if (s.deblur > 0) {
 +        snprintf(deb, sizeof(deb), "refused");
 +    }
 +    if (e->up_live) {
 +        snprintf(up, sizeof(up), "%s-%s", family_name(e->up_family),
 +                 m_opt_choice_str(deblur_names, e->up_level));
-+    } else if (s->up_family != NVVFX_UPSCALE_OFF) {
++    } else if (s.up_family != NVVFX_UPSCALE_OFF) {
 +        snprintf(up, sizeof(up), "refused");
 +    }
 +    if (created) {
@@ -4550,19 +6020,18 @@ index 0000000..2f0a78f
 +        snprintf(how, sizeof(how), "reused from the cache");
 +    }
 +    MP_INFO(f, "Pipeline live: %dx%d -> %dx%d, deblur %s, upscale %s, "
-+            "transport %s (%s), %s%s%s\n",
++            "transport %s (%s), on the private device, %s%s%s\n",
 +            pi->in_w, pi->in_h, pi->out_w, pi->out_h, deb, up,
 +            pi->transport == NVVFX_TRANSPORT_DIRECT ? "direct" : "r32",
 +            transport_format_name(pi->transport_format), how,
 +            pi->fallback[0] ? "; " : "", pi->fallback);
 +}
 +
-+// Pick up what the worker has done. Runs at the top of every process() call,
-+// which the worker's mp_filter_wakeup() triggers.
++// Pick up what the worker has done.
 +static void adopt(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
-+    if (!p->thread_ok)
++    if (!p->worker_ok)
 +        return;
 +
 +    struct link *l = p->link;
@@ -4586,7 +6055,7 @@ index 0000000..2f0a78f
 +
 +    if (rt_failed && !p->rt_seen_failed) {
 +        p->rt_seen_failed = true;
-+        give_up(f, rt_detail[0] ? rt_detail : "NVIDIA runtime not found",
++        give_up(f, false, rt_detail[0] ? rt_detail : "NVIDIA runtime not found",
 +                "NVIDIA Video Effects runtime unavailable: %s", rt_error);
 +    }
 +    if (!have)
@@ -4600,231 +6069,64 @@ index 0000000..2f0a78f
 +    if (res.nomem) {
 +        p->mem_refused = true;
 +        p->refused_shape = res.job.shape;
-+        warn_mem(f, "another pipeline", res.free_mb, res.need_mb);
++        if (!p->warned_mem)
++            MP_WARN(f, "Not loading another pipeline: %.0f MB of GPU memory left, "
++                    "%.0f MB wanted. The NVIDIA SDK keeps every model it loaded "
++                    "until the app exits; restart it to free them.\n",
++                    res.free_mb, res.need_mb);
++        p->warned_mem = true;
 +        return;
 +    }
 +    if (!res.entry) {
-+        give_up(f, res.error, "Creating the VideoSuperRes pipeline failed: %s",
++        give_up(f, false, res.error, "Creating the VideoSuperRes pipeline failed: %s",
 +                res.error);
 +        return;
 +    }
-+    take_pipeline(f, res.entry, &res.job.shape, res.created, res.ms);
++    // Switched to with the next frame that fits it, once nothing is in flight.
++    drop_ready(p);
++    p->ready = res.entry;
++    p->ready_shape = res.job.shape;
++    p->ready_created = res.created;
++    p->ready_ms = res.ms;
 +}
 +
-+// Bring the levels and strengths of the pipeline in hand to what the options
-+// ask for, as far as allowed. Returns <0 on an error, else 1. Called with
-+// nv_run_lock held.
-+static int apply_live(struct mp_filter *f, struct cached *e)
++// Look at the runner's state: a frame it has been on for too long.
++static void watch(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
-+    double free_mb, need_mb;
-+
-+    // Levels, for the stages the pipeline has and the options still want.
-+    int dl = e->deblur_live && p->opts->deblur > 0 ? p->opts->deblur : 0;
-+    int ul = e->up_live && upscale_family(p->opts->upscale) == e->up_family ?
-+             upscale_level(p->opts->upscale) : 0;
-+    if (!dl || dl == e->deblur_level) {
-+        p->deb_held = 0;
-+        dl = 0;
-+    } else if (dl == p->deb_held) {
-+        dl = 0;
-+    } else if (!(e->deblur_used & (1u << dl)) &&
-+               !headroom_ok(p->adapter3, e->out_w, e->out_h, &free_mb, &need_mb))
-+    {
-+        p->deb_held = dl;
-+        p->deb_held_mem = true;
-+        warn_mem(f, "another deblur level", free_mb, need_mb);
-+        dl = 0;
-+    }
-+    if (!ul || ul == e->up_level) {
-+        p->up_held = 0;
-+        ul = 0;
-+    } else if (ul == p->up_held) {
-+        ul = 0;
-+    } else if (!(e->up_used & (1u << ul)) &&
-+               !headroom_ok(p->adapter3, e->out_w, e->out_h, &free_mb, &need_mb))
-+    {
-+        p->up_held = ul;
-+        p->up_held_mem = true;
-+        warn_mem(f, "another upscale level", free_mb, need_mb);
-+        ul = 0;
-+    }
-+    if (dl || ul) {
-+        int r = nvvfx_pipeline_set_levels(e->pl, dl ? dl : -1, ul ? ul : -1);
-+        if (r < 0)
-+            return r;
-+        if (r == 0) {
-+            // The SDK refused (logged by the core): keep the levels in force.
-+            if (!p->warned_refused)
-+                MP_WARN(f, "The level change was refused; keeping the current levels.\n");
-+            p->warned_refused = true;
-+            if (dl) {
-+                p->deb_held = dl;
-+                p->deb_held_mem = false;
++    struct link *l = p->link;
++    mp_mutex_lock(&l->lock);
++    bool stalled = l->stalled;
++    l->stalled = false;
++    if (stalled && !p->broken) {
++        // The running frame leaves unprocessed; the runner's result for it,
++        // if it ever comes, is dropped (find_job sees it is not running).
++        for (int n = 0; n < l->count; n++) {
++            struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++            if (j->state == JOB_RUNNING) {
++                j->state = JOB_DONE;
++                j->cancelled = true;
++                j->status = NVVFX_E_TIMEOUT;
 +            }
-+            if (ul) {
-+                p->up_held = ul;
-+                p->up_held_mem = false;
-+            }
-+        } else {
-+            if (dl) {
-+                e->deblur_level = dl;
-+                e->deblur_used |= 1u << dl;
-+            }
-+            if (ul) {
-+                e->up_level = ul;
-+                e->up_used |= 1u << ul;
-+            }
-+            MP_VERBOSE(f, "Levels changed live: deblur %s, upscale %s.\n",
-+                       e->deblur_live ? m_opt_choice_str(deblur_names, e->deblur_level) : "off",
-+                       e->up_live ? m_opt_choice_str(deblur_names, e->up_level) : "off");
 +        }
 +    }
-+
-+    // Strengths: free to change.
-+    float ds = e->deblur_live && p->opts->deblur > 0 ? p->opts->deblur_strength : -1.0f;
-+    float us = e->up_live && upscale_family(p->opts->upscale) == e->up_family ?
-+               p->opts->upscale_strength : -1.0f;
-+    if (ds == e->deblur_str || ds == p->deb_str_held)
-+        ds = -1.0f;
-+    if (us == e->up_str || us == p->up_str_held)
-+        us = -1.0f;
-+    if (ds >= 0 || us >= 0) {
-+        int r = nvvfx_pipeline_set_strength(e->pl, ds, us);
-+        if (r < 0)
-+            return r;
-+        if (r == 0) {
-+            if (!p->warned_refused)
-+                MP_WARN(f, "The strength change was refused; keeping the current strengths.\n");
-+            p->warned_refused = true;
-+            if (ds >= 0)
-+                p->deb_str_held = ds;
-+            if (us >= 0)
-+                p->up_str_held = us;
-+        } else {
-+            if (ds >= 0)
-+                e->deblur_str = ds;
-+            if (us >= 0)
-+                e->up_str = us;
-+            MP_VERBOSE(f, "Strengths changed live: deblur %.2f, upscale %.2f.\n",
-+                       e->deblur_str, e->up_str);
-+        }
++    mp_mutex_unlock(&l->lock);
++    if (stalled && !p->broken) {
++        give_up(f, true, "the GPU did not finish a frame in time",
++                "The NVIDIA device has not finished a frame in %d s", NVVFX_STALL_MS / 1000);
 +    }
-+    return 1;
-+}
-+
-+static bool ensure_texture(struct priv *p, ID3D11Texture2D **tex, int *tw, int *th,
-+                           int w, int h, UINT bind)
-+{
-+    if (*tex && *tw == w && *th == h)
-+        return true;
-+    SAFE_RELEASE(*tex);
-+    D3D11_TEXTURE2D_DESC desc = {
-+        .Width = w,
-+        .Height = h,
-+        .MipLevels = 1,
-+        .ArraySize = 1,
-+        .Format = DXGI_FORMAT_R10G10B10A2_UNORM,
-+        .SampleDesc = {.Count = 1},
-+        .Usage = D3D11_USAGE_DEFAULT,
-+        .BindFlags = bind,
-+    };
-+    if (FAILED(ID3D11Device_CreateTexture2D(p->dev, &desc, NULL, tex))) {
-+        *tex = NULL;
-+        return false;
-+    }
-+    *tw = w;
-+    *th = h;
-+    return true;
-+}
-+
-+// A plain D3D11 copy. The device lock is held around this one immediate-
-+// context call only, never across a call into the core.
-+static void copy_region(struct priv *p, ID3D11Texture2D *dst, UINT dst_sub,
-+                        ID3D11Texture2D *src, UINT src_sub, int w, int h)
-+{
-+    D3D11_BOX box = {
-+        .left = 0, .top = 0, .front = 0,
-+        .right = w, .bottom = h, .back = 1,
-+    };
-+    if (p->mt)
-+        ID3D10Multithread_Enter(p->mt);
-+    ID3D11DeviceContext_CopySubresourceRegion(p->ctx, (ID3D11Resource *)dst,
-+        dst_sub, 0, 0, 0, (ID3D11Resource *)src, src_sub, &box);
-+    if (p->mt)
-+        ID3D10Multithread_Leave(p->mt);
-+}
-+
-+// NULL if the frame can be processed, else why not.
-+static const char *check_input(struct priv *p, struct mp_image *in)
-+{
-+    if (in->imgfmt != IMGFMT_D3D11 || in->params.hw_subfmt != IMGFMT_X2BGR10 ||
-+        !in->planes[0])
-+        return "input is not d3d11[x2bgr10]";
-+    ID3D11Device *dev = NULL;
-+    ID3D11Texture2D_GetDevice((ID3D11Texture2D *)in->planes[0], &dev);
-+    bool same = dev == p->dev;
-+    SAFE_RELEASE(dev);
-+    if (!same)
-+        return "input is on another D3D11 device";
-+    if (in->w < 16 || in->h < 16 || in->w > 16384 || in->h > 16384)
-+        return "input size out of range";
-+    return NULL;
-+}
-+
-+// The texture to hand the core: the frame's own if it is a plain texture of
-+// exactly the frame's size, else a copy of it in a texture of our own.
-+static ID3D11Texture2D *input_texture(struct priv *p, struct mp_image *in,
-+                                      char *err, size_t err_size)
-+{
-+    ID3D11Texture2D *tex = (ID3D11Texture2D *)in->planes[0];
-+    UINT slice = (UINT)(intptr_t)in->planes[1];
-+    D3D11_TEXTURE2D_DESC d;
-+    ID3D11Texture2D_GetDesc(tex, &d);
-+    if (d.Format != DXGI_FORMAT_R10G10B10A2_UNORM &&
-+        d.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS)
-+    {
-+        snprintf(err, err_size, "the input texture is DXGI format %d", (int)d.Format);
-+        return NULL;
-+    }
-+    if (d.Width < (UINT)in->w || d.Height < (UINT)in->h || slice >= d.ArraySize ||
-+        d.SampleDesc.Count != 1)
-+    {
-+        snprintf(err, err_size, "the input texture (%ux%u, %u slices) does not "
-+                 "hold a %dx%d frame at slice %u", d.Width, d.Height, d.ArraySize,
-+                 in->w, in->h, slice);
-+        return NULL;
-+    }
-+    if (slice == 0 && d.ArraySize == 1 && d.Width == (UINT)in->w &&
-+        d.Height == (UINT)in->h)
-+        return tex;
-+    if (!ensure_texture(p, &p->in_copy, &p->in_copy_w, &p->in_copy_h, in->w, in->h,
-+                        D3D11_BIND_SHADER_RESOURCE))
-+    {
-+        snprintf(err, err_size, "creating a %dx%d input texture failed", in->w, in->h);
-+        return NULL;
-+    }
-+    copy_region(p, p->in_copy, 0, tex, slice * d.MipLevels, in->w, in->h);
-+    return p->in_copy;
 +}
 +
 +// (Re)create the output frames pool for the pipeline in hand: its output
-+// description, plus what the VO's d3d11va mapper needs, sized up to even
-+// dimensions (the mapper's copy texture is aligned to 2 and must fit).
-+static bool update_pool(struct priv *p, char *err, size_t err_size)
++// size, rounded up to even dimensions (the VO's d3d11va mapper's copy texture
++// is aligned to 2 and must fit), bound as the VO wants it. The result is
++// copied in, so nothing else is needed.
++static bool update_pool(struct priv *p, struct cached *e, char *err, size_t err_size)
 +{
-+    D3D11_TEXTURE2D_DESC d;
-+    nvvfx_pipeline_out_desc(p->cur->pl, &d);
-+    int w = MP_ALIGN_UP((int)d.Width, 2), h = MP_ALIGN_UP((int)d.Height, 2);
-+    UINT bind = d.BindFlags | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-+    if (p->out_pool && p->pool_w == w && p->pool_h == h && p->pool_bind == bind &&
-+        p->pool_misc == d.MiscFlags)
++    int w = MP_ALIGN_UP(e->out_w, 2), h = MP_ALIGN_UP(e->out_h, 2);
++    if (p->out_pool && p->pool_w == w && p->pool_h == h)
 +        return true;
 +    av_buffer_unref(&p->out_pool);
-+    if (d.Format != DXGI_FORMAT_R10G10B10A2_UNORM) {
-+        snprintf(err, err_size, "unexpected output format %d", (int)d.Format);
-+        return false;
-+    }
 +    AVBufferRef *ref = av_hwframe_ctx_alloc(p->av_device_ref);
 +    if (!ref) {
 +        snprintf(err, err_size, "allocating the output frames context failed");
@@ -4836,8 +6138,8 @@ index 0000000..2f0a78f
 +    fctx->width = w;
 +    fctx->height = h;
 +    AVD3D11VAFramesContext *hwfctx = fctx->hwctx;
-+    hwfctx->BindFlags = bind;
-+    hwfctx->MiscFlags = d.MiscFlags;
++    hwfctx->BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
++    hwfctx->MiscFlags = 0;
 +    if (av_hwframe_ctx_init(ref) < 0) {
 +        av_buffer_unref(&ref);
 +        snprintf(err, err_size, "initialising a %dx%d output frames pool failed", w, h);
@@ -4846,14 +6148,13 @@ index 0000000..2f0a78f
 +    p->out_pool = ref;
 +    p->pool_w = w;
 +    p->pool_h = h;
-+    p->pool_bind = bind;
-+    p->pool_misc = d.MiscFlags;
 +    return true;
 +}
 +
-+static struct mp_image *alloc_out(struct priv *p, char *err, size_t err_size)
++static struct mp_image *alloc_out(struct priv *p, struct cached *e, char *err,
++                                  size_t err_size)
 +{
-+    if (!update_pool(p, err, err_size))
++    if (!update_pool(p, e, err, err_size))
 +        return NULL;
 +    AVFrame *av_frame = av_frame_alloc();
 +    MP_HANDLE_OOM(av_frame);
@@ -4892,54 +6193,12 @@ index 0000000..2f0a78f
 +    }
 +}
 +
-+// One frame through the pipeline in hand. Called with nv_run_lock held. NULL
-+// (with err set, and *core_failed if the pipeline itself failed) on failure;
-+// the input frame is untouched either way.
-+static struct mp_image *run_pipeline(struct priv *p, struct mp_image *in,
-+                                     char *err, size_t err_size, bool *core_failed)
++// The texture and subresource a D3D11 frame lives in.
++static UINT frame_subresource(struct mp_image *img)
 +{
-+    struct cached *e = p->cur;
-+    ID3D11Texture2D *src = input_texture(p, in, err, err_size);
-+    if (!src)
-+        return NULL;
-+    struct mp_image *out = alloc_out(p, err, err_size);
-+    if (!out)
-+        return NULL;
-+
-+    int ow = e->out_w, oh = e->out_h;
-+    ID3D11Texture2D *dst = (ID3D11Texture2D *)out->planes[0];
-+    UINT dst_slice = (UINT)(intptr_t)out->planes[1];
-+    bool direct = dst_slice == 0 && p->pool_w == ow && p->pool_h == oh;
-+    ID3D11Texture2D *target = dst;
-+    if (!direct) {
-+        D3D11_TEXTURE2D_DESC d;
-+        nvvfx_pipeline_out_desc(e->pl, &d);
-+        if (!ensure_texture(p, &p->out_tmp, &p->out_tmp_w, &p->out_tmp_h, ow, oh,
-+                            d.BindFlags))
-+        {
-+            snprintf(err, err_size, "creating a %dx%d output texture failed", ow, oh);
-+            talloc_free(out);
-+            return NULL;
-+        }
-+        target = p->out_tmp;
-+    }
-+
-+    int r = nvvfx_pipeline_run(e->pl, src, target);
-+    if (r < 0) {
-+        core_error(err, err_size, r);
-+        *core_failed = true;
-+        talloc_free(out);
-+        return NULL;
-+    }
-+    if (!direct) {
-+        D3D11_TEXTURE2D_DESC dd;
-+        ID3D11Texture2D_GetDesc(dst, &dd);
-+        copy_region(p, dst, dst_slice * dd.MipLevels, target, 0, ow, oh);
-+    }
-+
-+    mp_image_set_size(out, ow, oh);
-+    set_out_attributes(out, in);
-+    return out;
++    D3D11_TEXTURE2D_DESC d;
++    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)img->planes[0], &d);
++    return (UINT)(intptr_t)img->planes[1] * d.MipLevels;
 +}
 +
 +// ---- statistics -----------------------------------------------------------
@@ -4968,26 +6227,33 @@ index 0000000..2f0a78f
 +    return (x > y) - (x < y);
 +}
 +
++static double ring_median(const double *ring, int n)
++{
++    double v[NVVFX_PTS_RING > NVVFX_LAT_RING ? NVVFX_PTS_RING : NVVFX_LAT_RING];
++    if (n <= 0)
++        return 0;
++    memcpy(v, ring, n * sizeof(v[0]));
++    qsort(v, n, sizeof(v[0]), cmp_double);
++    return v[n / 2];
++}
++
 +// The frame duration in ms from the frames' timestamps (the container's frame
 +// rate if they say nothing yet), 0 if unknown.
 +static double frame_ms(struct priv *p)
 +{
-+    if (p->num_delta >= 3) {
-+        double v[NVVFX_PTS_RING];
-+        int n = p->num_delta;
-+        memcpy(v, p->pts_delta, n * sizeof(v[0]));
-+        qsort(v, n, sizeof(v[0]), cmp_double);
-+        return 1000.0 * v[n / 2];
-+    }
++    if (p->num_delta >= 3)
++        return 1000.0 * ring_median(p->pts_delta, p->num_delta);
 +    return p->nominal_fps > 0 ? 1000.0 / p->nominal_fps : 0;
 +}
 +
 +static void report_stats(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
-+    nvvfx_stage_stats st[NVVFX_STAGE_COUNT];
++    nvvfx_stage_stats st[NVVFX_STAGE_COUNT], cycle, wait_peer;
 +    for (int n = 0; n < NVVFX_STAGE_COUNT; n++)
 +        nvvfx_pipeline_stats(p->cur->pl, n, &st[n]);
++    nvvfx_xfer_stats(p->cur->xfer, NVVFX_XFER_CYCLE, &cycle);
++    nvvfx_xfer_stats(p->cur->xfer, NVVFX_XFER_WAIT_PEER, &wait_peer);
 +    double budget = frame_ms(p);
 +    const nvvfx_stage_stats *total = &st[NVVFX_STAGE_TOTAL];
 +
@@ -5007,9 +6273,13 @@ index 0000000..2f0a78f
 +                                          s->gpu_max_ms);
 +        }
 +        MP_VERBOSE(f, "GPU ms median/p99/max over the last %d frames: %s; "
-+                   "run call (CPU) median %.2f ms; frame %.2f ms\n",
++                   "run (wall) median %.2f / p99 %.2f / max %.2f ms, of it waiting "
++                   "for the video device median %.2f / max %.2f ms; frame in to "
++                   "result out median %.2f ms; frame %.2f ms\n",
 +                   total->gpu_count, line[0] ? line : "(no samples yet)",
-+                   total->median_ms, budget);
++                   cycle.median_ms, cycle.p99_ms, cycle.max_ms,
++                   wait_peer.median_ms, wait_peer.max_ms,
++                   ring_median(p->latency, p->num_lat), budget);
 +        talloc_free(line);
 +    }
 +
@@ -5030,28 +6300,119 @@ index 0000000..2f0a78f
 +    if (p->mem_refused && want && same_shape(&p->refused_shape, want) &&
 +        !(p->cur && same_shape(&p->cur_shape, want)))
 +        return mem_full_detail;
-+    if (p->cur && ((p->deb_held && p->deb_held_mem) || (p->up_held && p->up_held_mem)))
++    if (p->cur && p->held_mem)
 +        return mem_full_detail;
 +    return NULL;
 +}
 +
-+// ---- per frame ------------------------------------------------------------
++// ---- the frame queue ------------------------------------------------------
 +
-+// Process one video frame. NULL means "pass the input through untouched".
-+static struct mp_image *filter_frame(struct mp_filter *f, struct mp_image *in)
++static int queue_count(struct priv *p)
++{
++    struct link *l = p->link;
++    mp_mutex_lock(&l->lock);
++    int n = l->count;
++    mp_mutex_unlock(&l->lock);
++    return n;
++}
++
++// Append a job (with l->lock held). The ring has room: the playloop takes a
++// frame only when queue_count() < NVVFX_QUEUE.
++static struct job *queue_push(struct link *l)
++{
++    struct job *j = &l->jobs[(l->head + l->count) % NVVFX_QUEUE];
++    *j = (struct job){.id = ++l->next_job_id};
++    l->count++;
++    return j;
++}
++
++// A frame that passes through, behind any frame still in flight.
++static void queue_pass(struct mp_filter *f, struct mp_image *in, const char *detail)
++{
++    struct priv *p = f->priv;
++    struct link *l = p->link;
++    mp_mutex_lock(&l->lock);
++    struct job *j = queue_push(l);
++    j->process = false;
++    j->state = JOB_DONE;
++    j->status = JOB_SKIPPED;
++    j->img = in;
++    snprintf(j->detail, sizeof(j->detail), "%s", detail ? detail : "");
++    mp_mutex_unlock(&l->lock);
++}
++
++static int free_slot(struct priv *p)
++{
++    for (int n = 0; n < NVVFX_SLOTS; n++) {
++        if (!p->slot_busy[n])
++            return n;
++    }
++    return -1;
++}
++
++// Queue a frame for the runner, its copy into slot `slot` already recorded.
++static void queue_process(struct mp_filter *f, struct mp_image *in, int slot)
++{
++    struct priv *p = f->priv;
++    struct link *l = p->link;
++    mp_mutex_lock(&l->lock);
++    struct job *j = queue_push(l);
++    j->process = true;
++    j->slot = slot;
++    j->entry = p->cur;
++    j->peer = p->peer;
++    j->live = (struct live){
++        .deblur = p->opts->deblur,
++        .deblur_strength = p->opts->deblur_strength,
++        .upscale = p->opts->upscale,
++        .upscale_strength = p->opts->upscale_strength,
++    };
++    j->t_queued = mp_time_ns();
++    j->state = JOB_QUEUED;
++    j->img = in;
++    mp_cond_signal(&l->run_cond);
++    mp_mutex_unlock(&l->lock);
++    p->slot_busy[slot] = true;
++    p->inflight++;
++}
++
++// The bookkeeping of a frame taken in.
++static bool took(struct priv *p, struct mp_image *in)
++{
++    p->last_in_w = in->w;
++    p->last_in_h = in->h;
++    note_pts(p, in);
++    return true;
++}
++
++// Take a frame in. Returns false if it was put back (it waits for a switch of
++// pipelines, or for a slot, until the frames in flight have left).
++static bool take_frame(struct mp_filter *f, struct mp_image *in)
 +{
 +    struct priv *p = f->priv;
 +
-+    p->last_in_w = p->last_out_w = in->w;
-+    p->last_in_h = p->last_out_h = in->h;
-+    note_pts(p, in);
-+
++    if (!p->broken && atomic_load(&nv_lost))
++        give_up(f, false, lost_detail, "An NVIDIA device was removed (GPU reset)");
 +    if (p->broken) {
-+        p->active = false;
-+        return NULL;
++        queue_pass(f, in, p->detail);
++        return took(p, in);
 +    }
 +
-+    const char *bad = check_input(p, in);
++    ID3D11Device *dev = NULL;
++    const char *bad = NULL;
++    if (in->imgfmt != IMGFMT_D3D11 || in->params.hw_subfmt != IMGFMT_X2BGR10 ||
++        !in->planes[0])
++    {
++        bad = "input is not d3d11[x2bgr10]";
++    } else {
++        ID3D11Texture2D_GetDevice((ID3D11Texture2D *)in->planes[0], &dev);
++        if (dev != p->dev) {
++            bad = "input is on another D3D11 device";
++        } else if (in->w < 16 || in->h < 16 || in->w > 16384 || in->h > 16384) {
++            bad = "input size out of range";
++        }
++        SAFE_RELEASE(dev);
++    }
 +    if (bad) {
 +        if (!p->warned_input) {
 +            MP_WARN(f, "Input %s[%s] %dx%d: %s; passing it through.\n",
@@ -5059,107 +6420,267 @@ index 0000000..2f0a78f
 +                    mp_imgfmt_to_name(in->params.hw_subfmt), in->w, in->h, bad);
 +        }
 +        p->warned_input = true;
-+        set_passthrough(p, bad);
-+        return NULL;
++        queue_pass(f, in, bad);
++        return took(p, in);
 +    }
 +
 +    struct shape want;
 +    const char *why = NULL;
++    p->have_last_want = false;
 +    if (!want_shape(f, in->w, in->h, &want, &why)) {
-+        if (p->cur)
++        if (p->cur && !p->want_release)
 +            MP_VERBOSE(f, "No stage left to run (%s).\n", why);
-+        release_current(p);
 +        cancel_build(p);
-+        set_passthrough(p, why);
-+        return NULL;
++        drop_ready(p);
++        if (p->cur) {
++            if (p->inflight) {
++                p->want_release = true;
++            } else {
++                release_current(p, false);
++            }
++        }
++        queue_pass(f, in, why);
++        return took(p, in);
 +    }
++
++    p->last_want = want;
++    p->have_last_want = true;
 +
 +    // The pipeline the options ask for: from the cache at once if there is a
 +    // free one, else from the worker.
 +    if (p->cur && same_shape(&p->cur_shape, &want)) {
 +        cancel_build(p);    // asked for something else, then back to this
++        drop_ready(p);
++        p->want_release = false;
 +    } else {
-+        if (!(p->building && same_shape(&p->want.shape, &want))) {
-+            struct cached *hit = cache_borrow(p->dev, &want);
++        if (p->ready && !same_shape(&p->ready_shape, &want))
++            drop_ready(p);
++        if (!p->ready && !(p->building && same_shape(&p->want.shape, &want))) {
++            struct cached *hit = cache_borrow(find_pdev(p->link->luid), &want);
 +            if (hit) {
 +                cancel_build(p);
-+                take_pipeline(f, hit, &want, false, 0);
-+                if (p->broken)
-+                    return NULL;
++                p->ready = hit;
++                p->ready_shape = want;
++                p->ready_created = false;
++                p->ready_ms = 0;
 +            } else if (!(p->mem_refused && same_shape(&p->refused_shape, &want))) {
 +                request_build(f, &want);
 +            }
 +        }
++        if (p->ready) {
++            if (p->inflight) {
++                // Every frame of the pipeline in hand leaves first.
++                p->switch_wait = true;
++                return false;
++            }
++            take_ready(f);
++            if (p->broken) {
++                queue_pass(f, in, p->detail);
++                return took(p, in);
++            }
++        }
 +    }
++    p->switch_wait = false;
 +
 +    // Until it is ready, keep running the pipeline in hand if it takes this
 +    // frame; otherwise pass the frame through.
 +    struct cached *e = p->cur;
 +    if (!e || e->in_w != in->w || e->in_h != in->h) {
 +        const char *notice = mem_notice(p, &want);
-+        set_passthrough(p, notice ? notice : "loading");
-+        return NULL;
++        queue_pass(f, in, notice ? notice : "loading");
++        return took(p, in);
 +    }
 +
-+    char err[1024] = "";
-+    bool core_failed = false;
-+    struct mp_image *out = NULL;
-+    mp_mutex_lock(&nv_run_lock);
++    int slot = free_slot(p);
++    if (slot < 0)
++        return false;       // (want_input() does not take a frame then)
++
++    char err[512] = "";
 +    nv_attach(p->link);
-+    int r = apply_live(f, e);
-+    if (r > 0) {
-+        out = run_pipeline(p, in, err, sizeof(err), &core_failed);
-+    } else {
++    int r = nvvfx_peer_put(p->peer, slot, (ID3D11Texture2D *)in->planes[0],
++                           frame_subresource(in));
++    if (r < 0)
 +        core_error(err, sizeof(err), r);
-+        core_failed = true;
-+    }
 +    nv_detach();
-+    mp_mutex_unlock(&nv_run_lock);
-+
-+    if (!out) {
-+        if (core_failed) {
-+            cache_kill(p->cur);     // never lend a failed pipeline again
-+            p->cur = NULL;
-+        }
-+        give_up(f, err, "VideoSuperRes failed mid-stream: %s", err);
-+        return NULL;
++    if (r < 0) {
++        give_up(f, false, err, "Copying a frame for the NVIDIA device failed: %s", err);
++        queue_pass(f, in, p->detail);
++        return took(p, in);
 +    }
++    queue_process(f, in, slot);
++    return took(p, in);
++}
++
++// Does the filter take another frame now? Only when it has room, and either
++// the next filter wants a frame or a frame is already in flight (so the next
++// one's copy can overlap its run); never while a switch of pipelines waits
++// for the frames in flight to leave.
++static bool want_input(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    if (p->switch_wait && p->inflight)
++        return false;
++    if (p->inflight >= NVVFX_SLOTS || queue_count(p) >= NVVFX_QUEUE)
++        return false;
++    return mp_pin_in_needs_data(f->ppins[1]) || p->inflight > 0;
++}
++
++// After a frame of the pipeline in hand has left.
++static void frame_left(struct priv *p, int slot)
++{
++    p->inflight--;
++    if (slot >= 0 && slot < NVVFX_SLOTS)
++        p->slot_busy[slot] = false;
++    if (!p->inflight && p->want_release && p->cur)
++        release_current(p, false);
++}
++
++// A frame failed on the private device: say why, once, and stop.
++static void job_failed(struct mp_filter *f, int status, bool peer_side, const char *error)
++{
++    if (peer_side && status == NVVFX_E_TIMEOUT) {
++        give_up(f, false, "the video device did not finish a copy in time",
++                "The video device did not finish a copy in time: %s", error);
++    } else if (status == NVVFX_E_LOST) {
++        atomic_store(&nv_lost, true);
++        give_up(f, true, lost_detail, "An NVIDIA device was removed: %s", error);
++    } else if (status == NVVFX_E_PEER_LOST) {
++        give_up(f, false, "the video device was lost", "The video device was lost: %s", error);
++    } else if (status == NVVFX_E_TIMEOUT) {
++        give_up(f, true, "the GPU did not finish a frame in time",
++                "VideoSuperRes did not finish a frame in time: %s", error);
++    } else {
++        give_up(f, true, error, "VideoSuperRes failed mid-stream: %s", error);
++    }
++}
++
++// Send the oldest frame on, if it is done. Returns false if there is none.
++// Call only when the output pin wants a frame.
++static bool emit_head(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    struct link *l = p->link;
++
++    mp_mutex_lock(&l->lock);
++    struct job *head = l->count ? &l->jobs[l->head] : NULL;
++    if (!head || head->state != JOB_DONE) {
++        mp_mutex_unlock(&l->lock);
++        return false;
++    }
++    struct job j = *head;
++    *head = (struct job){0};
++    l->head = (l->head + 1) % NVVFX_QUEUE;
++    l->count--;
++    mp_mutex_unlock(&l->lock);
++
++    if (!j.process) {
++        if (j.img) {
++            set_passthrough(p, j.detail);
++            p->last_out_w = j.img->w;
++            p->last_out_h = j.img->h;
++            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
++        }
++        return true;
++    }
++
++    // A frame of the pipeline in hand (p->cur, p->peer: no switch happens
++    // while one is in flight, and a give-up released them already). The slot
++    // is given back only after the copy out of it has been recorded.
++    if (!j.img) {
++        frame_left(p, j.slot);
++        return true;        // dropped by a reset
++    }
++    if (j.status < 0 && !p->broken)
++        job_failed(f, j.status, j.peer_side, j.error);
++    if (j.status != NVVFX_OK || p->broken || !p->cur) {
++        frame_left(p, j.slot);
++        set_passthrough(p, p->detail[0] ? p->detail : "passing through");
++        p->last_out_w = j.img->w;
++        p->last_out_h = j.img->h;
++        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
++        return true;
++    }
++
++    struct cached *e = p->cur;
++    char err[512] = "";
++    struct mp_image *out = alloc_out(p, e, err, sizeof(err));
++    int r = NVVFX_E_ARG;
++    if (out) {
++        nv_attach(p->link);
++        r = nvvfx_peer_get(p->peer, j.slot, (ID3D11Texture2D *)out->planes[0],
++                           frame_subresource(out));
++        if (r < 0)
++            core_error(err, sizeof(err), r);
++        nv_detach();
++    }
++    if (r < 0) {
++        talloc_free(out);
++        give_up(f, false, err, "Copying a frame from the NVIDIA device failed: %s", err);
++        frame_left(p, j.slot);
++        p->last_out_w = j.img->w;
++        p->last_out_h = j.img->h;
++        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, j.img));
++        return true;
++    }
++    mp_image_set_size(out, e->out_w, e->out_h);
++    set_out_attributes(out, j.img);
++    talloc_free(j.img);
 +
 +    set_active(p);
-+    const char *notice = mem_notice(p, &want);
++    p->held_mem = j.deb_held_mem || j.up_held_mem;
++    const char *notice = mem_notice(p, p->have_last_want ? &p->last_want : NULL);
 +    if (notice)
 +        snprintf(p->detail, sizeof(p->detail), "%s", notice);
 +    p->last_out_w = out->w;
 +    p->last_out_h = out->h;
++    p->latency[p->pos_lat] = MP_TIME_NS_TO_MS(mp_time_ns() - j.t_queued);
++    p->pos_lat = (p->pos_lat + 1) % NVVFX_LAT_RING;
++    if (p->num_lat < NVVFX_LAT_RING)
++        p->num_lat++;
 +    int every = p->opts->stats > 0 ? p->opts->stats : NVVFX_DEFAULT_STATS;
 +    if (++p->frames_since_report >= every) {
 +        p->frames_since_report = 0;
 +        report_stats(f);
 +    }
-+    return out;
++    frame_left(p, j.slot);
++    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
++    return true;
 +}
 +
 +static void vf_nvvfx_process(struct mp_filter *f)
 +{
 +    adopt(f);
++    watch(f);
 +
-+    if (!mp_pin_can_transfer_data(f->ppins[1], f->ppins[0]))
++    // Finished frames go on, oldest first, as far as the next filter takes them.
++    while (mp_pin_in_needs_data(f->ppins[1]) && emit_head(f))
++        ;
++
++    if (!want_input(f))
 +        return;
 +
 +    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
++    if (frame.type == MP_FRAME_NONE)
++        return;             // requested; process() runs again when it comes
 +
-+    // EOF and anything that is not a picture goes through as is. Nothing is
-+    // ever buffered here, so there is nothing to drain.
-+    if (frame.type == MP_FRAME_VIDEO) {
-+        struct mp_image *in = frame.data;
-+        struct mp_image *out = filter_frame(f, in);
-+        if (out) {
-+            talloc_free(in);
-+            frame = MAKE_FRAME(MP_FRAME_VIDEO, out);
++    if (frame.type != MP_FRAME_VIDEO) {
++        // EOF (or anything else) goes after every frame before it.
++        if (queue_count(f->priv) || !mp_pin_in_needs_data(f->ppins[1])) {
++            mp_pin_out_unread(f->ppins[0], frame);
++            return;
 +        }
++        mp_pin_in_write(f->ppins[1], frame);
++        return;
 +    }
 +
-+    mp_pin_in_write(f->ppins[1], frame);
++    if (!take_frame(f, frame.data)) {
++        // It waits for the frames in flight; the runner's wake-up brings
++        // process() back.
++        mp_pin_out_unread(f->ppins[0], frame);
++        return;
++    }
++    // Send it on at once if it passes through, or take another.
++    mp_filter_internal_mark_progress(f);
 +}
 +
 +// ---- commands and metadata ------------------------------------------------
@@ -5259,6 +6780,8 @@ index 0000000..2f0a78f
 +            tag_ms(t, "transfer_ms", s_in.gpu_median_ms + s_out.gpu_median_ms);
 +        if (s_total.gpu_count)
 +            tag_ms(t, "total_ms", s_total.gpu_median_ms);
++        if (p->num_lat)
++            tag_ms(t, "latency_ms", ring_median(p->latency, p->num_lat));
 +    }
 +
 +    tag_int(t, "in_w", p->last_in_w);
@@ -5297,57 +6820,103 @@ index 0000000..2f0a78f
 +static void vf_nvvfx_reset(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
-+    // Seeks keep the pipeline (and nothing is buffered); only the timestamp
-+    // chain restarts.
++    struct link *l = p->link;
++    struct mp_image *drop[NVVFX_QUEUE];
++    int num_drop = 0;
++
++    // Seeks keep the pipeline. Frames held are dropped: the ones still queued
++    // are not run, a running one finishes and is thrown away, and each leaves
++    // the queue (giving back its slot) as the next ones would.
++    mp_mutex_lock(&l->lock);
++    for (int n = 0; n < l->count; n++) {
++        struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++        if (j->img)
++            drop[num_drop++] = j->img;
++        j->img = NULL;
++        if (j->state == JOB_QUEUED) {
++            j->state = JOB_DONE;
++            j->status = JOB_SKIPPED;
++        }
++        j->cancelled = true;
++    }
++    mp_mutex_unlock(&l->lock);
++    for (int n = 0; n < num_drop; n++)
++        talloc_free(drop[n]);
++    p->switch_wait = false;
 +    p->last_pts = MP_NOPTS_VALUE;
 +}
 +
 +static void vf_nvvfx_destroy(struct mp_filter *f)
 +{
 +    struct priv *p = f->priv;
-+
-+    // Pipelines go back to the cache, never away. Frames already sent
-+    // downstream depend on none of this.
-+    release_current(p);
-+
-+    // The worker is never waited for: this runs on the playloop, and the
-+    // worker may be inside a creation for another half second. It finishes
-+    // on its own, gives what it made to the cache and exits; from here on it
-+    // logs nowhere and wakes nobody.
 +    struct link *l = p->link;
++    struct mp_image *drop[NVVFX_QUEUE];
++    int num_drop = 0;
++
++    drop_ready(p);
++
++    // Neither thread is waited for: this runs on the playloop, the worker may
++    // be inside a creation for another half second and the runner inside a
++    // frame. Each finishes on its own, gives back what it holds and exits;
++    // from here on they log nowhere and wake nobody.
 +    if (l) {
 +        mp_mutex_lock(&l->log_lock);
 +        l->log = NULL;
 +        mp_mutex_unlock(&l->log_lock);
-+        if (p->thread_ok) {
-+            mp_mutex_lock(&nv_orphan_lock);
-+            nv_orphans++;
-+            mp_mutex_unlock(&nv_orphan_lock);
-+        }
++        mp_mutex_lock(&nv_orphan_lock);
++        nv_orphans += (p->worker_ok ? 1 : 0) + (p->runner_ok ? 1 : 0);
++        mp_mutex_unlock(&nv_orphan_lock);
++
 +        mp_mutex_lock(&l->lock);
 +        l->f = NULL;
 +        l->job_pending = false;
 +        l->wanted = 0;
-+        struct cached *ready = l->result_ready ? l->result.entry : NULL;
++        struct cached *built = l->result_ready ? l->result.entry : NULL;
 +        l->result.entry = NULL;
 +        l->result_ready = false;
++        for (int n = 0; n < l->count; n++) {
++            struct job *j = &l->jobs[(l->head + n) % NVVFX_QUEUE];
++            if (j->img)
++                drop[num_drop++] = j->img;
++            j->img = NULL;
++            if (j->state == JOB_QUEUED) {
++                j->state = JOB_DONE;
++                j->status = JOB_SKIPPED;
++            }
++            j->cancelled = true;
++        }
++        // The pipeline in hand goes back once no frame of it runs: now, or
++        // when the runner is done with the one it is running.
++        struct release r = {.entry = p->cur, .peer = p->peer};
++        bool later = (p->cur || p->peer) && l->busy && p->runner_ok &&
++                     l->num_releases < (int)MP_ARRAY_SIZE(l->releases);
++        if (later)
++            l->releases[l->num_releases++] = r;
++        bool leak = (p->cur || p->peer) && l->busy && !later;
 +        mp_cond_signal(&l->cond);
++        mp_cond_signal(&l->run_cond);
 +        mp_mutex_unlock(&l->lock);
-+        cache_return(ready);
-+        if (p->thread_ok)
-+            mp_thread_detach(p->thread);
-+        p->thread_ok = false;
++
++        cache_return(built);
++        if (!later && !leak)
++            release_now(&r);
++        p->cur = NULL;
++        p->peer = NULL;
++        if (p->worker_ok)
++            mp_thread_detach(p->worker);
++        if (p->runner_ok)
++            mp_thread_detach(p->runner);
++        p->worker_ok = p->runner_ok = false;
 +        link_unref(l);
 +        p->link = NULL;
 +    }
++    for (int n = 0; n < num_drop; n++)
++        talloc_free(drop[n]);
 +
-+    SAFE_RELEASE(p->in_copy);
-+    SAFE_RELEASE(p->out_tmp);
 +    // Frames already downstream hold their own reference to the pool.
 +    av_buffer_unref(&p->out_pool);
 +    SAFE_RELEASE(p->adapter3);
 +    SAFE_RELEASE(p->mt);
-+    SAFE_RELEASE(p->ctx);
 +    SAFE_RELEASE(p->dev);
 +    av_buffer_unref(&p->av_device_ref);
 +}
@@ -5396,7 +6965,6 @@ index 0000000..2f0a78f
 +    p->link->f = f;
 +    p->link->log = f->log;
 +    p->last_pts = MP_NOPTS_VALUE;
-+    p->deb_str_held = p->up_str_held = -1.0f;
 +    set_passthrough(p, "loading");
 +
 +    // From here on nothing fails the creation: a failed filter would take
@@ -5405,7 +6973,7 @@ index 0000000..2f0a78f
 +    struct mp_hwdec_ctx *hwctx =
 +        mp_filter_load_hwdec_device(f, IMGFMT_D3D11, AV_HWDEVICE_TYPE_D3D11VA);
 +    if (!hwctx || !hwctx->av_device_ref) {
-+        give_up(f, "no D3D11 device",
++        give_up(f, false, "no D3D11 device",
 +                "No D3D11 device (needs hwdec=d3d11va and a D3D11 VO)");
 +        return f;
 +    }
@@ -5415,15 +6983,23 @@ index 0000000..2f0a78f
 +    AVD3D11VADeviceContext *d3dctx = avhwctx->hwctx;
 +    p->dev = d3dctx->device;
 +    ID3D11Device_AddRef(p->dev);
-+    ID3D11Device_GetImmediateContext(p->dev, &p->ctx);
++    // The runner reads an event query on the VO's immediate context from its
++    // own thread; mpv's d3d11va hwdec has made the device multithread-
++    // protected already, and this makes sure.
 +    if (FAILED(ID3D11Device_QueryInterface(p->dev, &IID_ID3D10Multithread,
 +                                           (void **)&p->mt)))
 +        p->mt = NULL;
++    if (p->mt && !ID3D10Multithread_GetMultithreadProtected(p->mt)) {
++        ID3D10Multithread_SetMultithreadProtected(p->mt, TRUE);
++        MP_VERBOSE(f, "Turned on multithread protection for the D3D11 device.\n");
++    }
 +    p->adapter3 = adapter3_of(p->dev);
 +
 +    struct link *l = p->link;
-+    l->dev = p->dev;
-+    ID3D11Device_AddRef(l->dev);
++    if (nvvfx_adapter_luid(p->dev, &l->luid) != NVVFX_OK) {
++        give_up(f, false, "no D3D11 adapter", "Could not identify the D3D11 adapter");
++        return f;
++    }
 +    l->adapter3 = p->adapter3;
 +    if (l->adapter3)
 +        IDXGIAdapter3_AddRef(l->adapter3);
@@ -5438,12 +7014,19 @@ index 0000000..2f0a78f
 +    // while the decoder is still starting.
 +    l->prepare = true;
 +    atomic_fetch_add(&l->refs, 1);
-+    if (mp_thread_create(&p->thread, worker_main, l) != 0) {
++    if (mp_thread_create(&p->worker, worker_main, l) != 0) {
 +        atomic_fetch_sub(&l->refs, 1);
-+        give_up(f, "could not start a thread", "Could not start the worker thread");
++        give_up(f, false, "could not start a thread", "Could not start the worker thread");
 +        return f;
 +    }
-+    p->thread_ok = true;
++    p->worker_ok = true;
++    atomic_fetch_add(&l->refs, 1);
++    if (mp_thread_create(&p->runner, runner_main, l) != 0) {
++        atomic_fetch_sub(&l->refs, 1);
++        give_up(f, false, "could not start a thread", "Could not start the runner thread");
++        return f;
++    }
++    p->runner_ok = true;
 +    return f;
 +}
 +
